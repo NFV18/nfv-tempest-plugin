@@ -21,6 +21,7 @@ import time
 from nfv_tempest_plugin.tests.common import shell_utilities as shell_utils
 from nfv_tempest_plugin.tests.scenario import base_test
 from nfv_tempest_plugin.tests.scenario.qos_manager import QoSManagerMixin
+from nfv_tempest_plugin.tests.scenario.dcb_manager import DCBManager
 from oslo_log import log as logging
 from tempest import config
 
@@ -512,3 +513,73 @@ class TestSriovScenarios(base_test.BaseTest, QoSManagerMixin):
         self.run_iperf_test(qos_policies, servers, key_pair, net_id)
         LOG.info('SRIOV Min QoS test, check test result.')
         self.collect_iperf_results(qos_rules_list, servers, key_pair)
+
+    def test_sriov_dcb_config(self, test='min_qos'):
+        """Test SRIOV DCB Config
+
+        SUPPORTED: Mellanox NICS only
+        """
+
+        LOG.info('Start SRIOV DCB Config test, search for Mellanox nics')
+        # Check setup contains Mellanox nics.
+        kw_args = dict()
+        kw_args['command'] = r"sudo lshw -class network -businfo | grep "
+        kw_args['file_path'] = CONF.nfv_plugin_options.conf_files['sriov-nova']
+        kw_args['search_param'] = \
+            {'section': 'pci', 'value': 'device_spec'}
+        """ Regexp search Mellanox connect-x """
+        kw_args['filter_regexp'] = \
+            r'.*\[ConnectX\-5 Ex\]|.*\[ConnectX\-5\]'
+        kw_args['servers_ips'] = self. \
+            _get_hypervisor_ip_from_undercloud()
+        kw_args['multi_key_values'] = True
+        result = shell_utils. \
+            run_hypervisor_command_build_from_config(**kw_args)
+        self.assertTrue(
+            len(result) > 0, "no computes for dcb config test")
+
+        LOG.info('Hypervisor and Mellanox nics {} \n'.format(result))
+        for hypervisor, interfaces in result.items():
+            # Check if there are interfaces listed for this hypervisor
+            if not interfaces:
+                LOG.warning('No interfaces found for hypervisor {}'.format(
+                             hypervisor))
+                continue
+
+            # Get the first interface entry for the hypervisor
+            first_int_entry = interfaces[0]
+            break
+
+        # Extract the interface name and set dut
+        try:
+            target_interface = first_int_entry.split()[1]
+            dut_hypervisor = hypervisor
+            LOG.info('Found Valid interface {} on hypervisor {}'.format(
+                      target_interface, hypervisor))
+        except IndexError:
+            LOG.error('Failed to get interface from {}'.format(
+                       first_int_entry))
+
+        config_result = self.create_and_apply_dcb_config(target_interface,
+                                                         dut_hypervisor)
+        if config_result:
+            config_check = self.verify_applied_dcb_config(target_interface,
+                                                          config_result)
+            if config_check == False:
+                raise ValueError("Configs verification failed")
+        else:
+            raise ValueError(f"Failed to apply config on {dut_hypervisor}")
+
+        config_result = self.remove_dcb_config(target_interface,
+                                               dut_hypervisor)
+        if config_result:
+            config_check = self.verify_cleared_dcb_config(target_interface,
+                                                          config_result)
+            if config_check == False:
+                raise ValueError("Configs verification failed")
+        else:
+            raise ValueError(f"Failed to remove config on {dut_hypervisor}")
+
+        cleanup_result = self.cleanup_temp_dcb_config_file(dut_hypervisor)
+        if cleanup_result == False:
+            raise ValueError(f"Failed to cleanup files on {dut_hypervisor}")
