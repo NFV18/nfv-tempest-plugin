@@ -378,12 +378,15 @@ def run_hypervisor_command_build_from_config(file_path, search_param,
         assert result != '', "{} {}".format(msg, hypervisor)
 
         result = "[" + result.replace('\n', ", ") + "]"
-        dev_names = [x.get('devname') for x in json.loads(result)]
-        # The nic-partitioning deployment does not store "devname" param.
+
+        # We must not use devname in pci config (potentially can change)
+        # Hence changing devname to address
+        dev_addrs = [x.get('address') for x in json.loads(result)]
+        # The nic-partitioning deployment does not store "address" param.
         # It has the "domain", "function" and other attributes.
         # As a result, many None params added to the list.
         # The below command excludes the "None" from the list.
-        dev_names = [devname for devname in dev_names if devname]
+        dev_addrs = [address for address in dev_addrs if address]
         cmd = ''
         for device in dev_names:
             cmd += "{} {};".format(command, device)
