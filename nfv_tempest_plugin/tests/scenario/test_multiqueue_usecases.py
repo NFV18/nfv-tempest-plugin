@@ -334,6 +334,7 @@ class TestMultiqueueScenarios(base_test.BaseTest):
         """
         # Get multiqueue/autobalance parameters
         autob_dict = json.loads(CONF.nfv_plugin_options.autobalance_config)
+        trex_mq_traffic_gen = CONF.nfv_plugin_options.trex_mq_traffic_gen
         trex_queues_json_path = CONF.nfv_plugin_options.trex_queues_json_path
         load_threshold = float(autob_dict["pmd-auto-lb-load-threshold"])
         interval = int(autob_dict["pmd-auto-lb-rebal-interval"]) * 60
@@ -376,10 +377,10 @@ class TestMultiqueueScenarios(base_test.BaseTest):
         timeout = int(interval * 2.20)
 
         # create injection command and start injection
-        inj_cmd = "/opt/trex/current/multiqueue.py  --action gen_traffic " \
-                  "--traffic_json {} --pps \"{}\" --duration {} " \
-                  "--multiplier {} > /tmp/multiqueue.log 2>&1 &". \
-            format(trex_queues_json_path, pps, timeout, multiplier)
+        inj_cmd = f"{trex_mq_traffic_gen} --action gen_traffic " \
+                  f"--traffic_json {trex_queues_json_path} " \
+                  f"--pps \"{pps}\" --duration {timeout} " \
+                  f"--multiplier {multiplier} > /tmp/multiqueue.log 2>&1 &"
 
         LOG.info('Injection command {}'.format(inj_cmd))
         servers_dict['trex']['ssh_source'].exec_command(inj_cmd)
