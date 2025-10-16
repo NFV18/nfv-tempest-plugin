@@ -177,6 +177,9 @@ NfvPluginOptions = [
                default='[{"port":"dpdk2", "queues":3},'
                        '{"port":"dpdk3", "queues":3}]',
                help='Multiqueue configuration for testcase'),
+    cfg.StrOpt('trex_mq_traffic_gen',
+               default='/opt/bench-trafficgen/trafficgen/multiqueue.py',
+               help='Multiqueue traffic generator path'),
     cfg.StrOpt('trex_queues_json_path',
                default='/tmp/queues.json',
                help='Learned data from queues configuration'),
