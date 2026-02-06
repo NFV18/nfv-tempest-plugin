@@ -97,7 +97,9 @@ class TestDpdkScenarios(base_test.BaseTest, QoSManagerMixin):
                  'Traffic_runner server - {}'.format(servers[0]['fip'],
                                                      servers[1]['fip'],
                                                      servers[2]['fip']))
-        mcast_group = '224.0.0.1'
+        # Detect if using IPv6 based on the floating IP address
+        is_ipv6 = ':' in str(servers[0]['fip'])
+        mcast_group = 'ff05::1' if is_ipv6 else '224.0.0.1'
         mcast_port = '10000'
         mcast_msg = 'mcast_pass'
         mcast_output = '/tmp/output'

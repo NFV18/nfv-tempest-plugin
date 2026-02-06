@@ -47,12 +47,25 @@ parser.add_argument('-c', '--count', help='Count of packets to send/receive',
                     required=False)
 args = parser.parse_args()
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+# Detect if the multicast group is IPv4 or IPv6
+is_ipv6 = ':' in args.group
+addr_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+
+sock = socket.socket(addr_family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
 if args.receive:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((args.group, int(args.port)))
-    mreq = struct.pack("4sl", socket.inet_aton(args.group), socket.INADDR_ANY)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    # IPv6 requires binding to '' (any address), not the multicast address
+    bind_addr = '' if is_ipv6 else args.group
+    sock.bind((bind_addr, int(args.port)))
+
+    if is_ipv6:
+        # IPv6 multicast membership
+        mreq = socket.inet_pton(socket.AF_INET6, args.group) + struct.pack('@I', 0)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+    else:
+        # IPv4 multicast membership
+        mreq = struct.pack("4sl", socket.inet_aton(args.group), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
     count = 1
     while True:
@@ -63,7 +76,12 @@ if args.receive:
             count += 1
 
 if args.send:
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+    if is_ipv6:
+        # IPv6 multicast hops (equivalent to TTL)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 32)
+    else:
+        # IPv4 multicast TTL
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
 
     count = 1
     while True:
