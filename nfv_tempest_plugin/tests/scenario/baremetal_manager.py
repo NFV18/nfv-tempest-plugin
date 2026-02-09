@@ -374,6 +374,12 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
             if 'mgmt' in net and 'dns_nameservers' in net:
                 self.test_network_dict[net['name']]['dns_nameservers'] = \
                     net['dns_nameservers']
+            if 'ipv6_address_mode' in net:
+                self.test_network_dict[net['name']]['ipv6_address_mode'] = \
+                    net['ipv6_address_mode']
+            if 'ipv6_ra_mode' in net:
+                self.test_network_dict[net['name']]['ipv6_ra_mode'] = \
+                    net['ipv6_ra_mode']
             if ('tag' in net and (2.32 <= float(self.request_microversion)
                                   <= 2.36 or float(self.request_microversion)
                                   >= 2.42)):
@@ -461,6 +467,11 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
             if 'dns_nameservers' in net_param:
                 network_kwargs['dns_nameservers'] = \
                     net_param['dns_nameservers']
+            if 'ipv6_address_mode' in net_param:
+                network_kwargs['ipv6_address_mode'] = \
+                    net_param['ipv6_address_mode']
+            if 'ipv6_ra_mode' in net_param:
+                network_kwargs['ipv6_ra_mode'] = net_param['ipv6_ra_mode']
 
             result = self.subnets_client.create_subnet(**network_kwargs)
             subnet = result['subnet']
@@ -816,7 +827,7 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
         return server
 
     def create_server_with_fip(self, num_servers=1, use_mgmt_only=False,
-                               fip=True, networks=None, srv_state='ACTIVE',
+                               fip=None, networks=None, srv_state='ACTIVE',
                                raise_on_error=True, **kwargs):
         """Create defined number of the instances with floating ip.
 
@@ -1029,6 +1040,7 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
         servers = []
         if num_servers:
             servers = self.create_server_with_fip(num_servers=num_servers,
+                                                  fip=self.fip,
                                                   networks=ports_list,
                                                   **kwargs)
             self._configure_vlan_trunk_vms(servers, key_pair,
