@@ -83,8 +83,10 @@ class TestDpdkScenarios(base_test.BaseTest, QoSManagerMixin):
         """The method boots three instances, runs mcast traffic between them"""
         LOG.info('Starting multicast test.')
         kwargs = {}
-        kwargs['sg_rules'] = [[{"protocol": "udp", "direction": "ingress"},
-                               {"protocol": "udp", "direction": "egress"}]]
+        kwargs['sg_rules'] = [[{"protocol": "udp", "direction": "ingress", "ethertype": "IPv4"},
+                               {"protocol": "udp", "direction": "egress", "ethertype": "IPv4"},
+                               {"protocol": "udp", "direction": "ingress", "ethertype": "IPv6"},
+                               {"protocol": "udp", "direction": "egress", "ethertype": "IPv6"}]]
         servers, key_pair = \
             self.create_server_with_resources(test=test, num_servers=3,
                                               use_mgmt_only=True, **kwargs)
@@ -227,7 +229,10 @@ class TestDpdkScenarios(base_test.BaseTest, QoSManagerMixin):
         qos_rules_list = [x for x in qos_rules]
         kwargs['sg_rules'] = [[{"protocol": "tcp", "direction": "ingress",
                               "port_range_max": 5102,
-                               "port_range_min": 5101}]]
+                               "port_range_min": 5101, "ethertype": "IPv4"},
+                              {"protocol": "tcp", "direction": "ingress",
+                              "port_range_max": 5102,
+                               "port_range_min": 5101, "ethertype": "IPv6"}]]
 
         servers, key_pair = self.create_and_verify_resources(
             test=test, num_servers=3, use_mgmt_only=True, **kwargs)
