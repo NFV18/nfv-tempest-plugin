@@ -1039,8 +1039,9 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
         kwargs['user_data'] = self._prepare_cloudinit_file(packages)
         servers = []
         if num_servers:
+            fip_value = kwargs.pop('fip', self.fip)
             servers = self.create_server_with_fip(num_servers=num_servers,
-                                                  fip=self.fip,
+                                                  fip=fip_value,
                                                   networks=ports_list,
                                                   **kwargs)
             self._configure_vlan_trunk_vms(servers, key_pair,

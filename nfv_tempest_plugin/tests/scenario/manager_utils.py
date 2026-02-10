@@ -669,24 +669,6 @@ class ManagerMixin(object):
         ssh.close()
         return result
 
-    def ping_via_network_namespace(self, ping_to_ip, network_id):
-        cmd = ("sudo ip netns exec qdhcp-" + network_id
-               + " ping -c 10 " + ping_to_ip)
-        ctrl_ip = urlparse(CONF.identity.uri).netloc.split(':')[0]
-        result = shell_utils.run_command_over_ssh(ctrl_ip, cmd)
-        for line in result.split('\n'):
-            if 'packets transmitted' in line:
-                LOG.info("Ping via namespace result: %s", line)
-                received_str = line.split(',')[1].strip()
-                try:
-                    received = int(received_str.split(' ')[0])
-                except ValueError:
-                    break
-                if received > 0:
-                    return True
-                break
-        return False
-
     def _read_and_validate_external_resources_data_file(self):
         """Validate yaml file contains externally created resources"""
         LOG.info("Found external resources file. Validating...")
