@@ -239,7 +239,6 @@ class TestNfvBasic(base_test.BaseTest):
         """
         # TODO(skramaja): Need to check if it is possible to execute ping
         #                 inside the guest VM using network namespace
-        self.assertTrue(self.fip, "Floating IP is required for mtu test")
 
         kwargs = {}
         if CONF.nfv_plugin_options.target_hypervisor:
@@ -252,10 +251,14 @@ class TestNfvBasic(base_test.BaseTest):
         servers, key_pair = self.create_and_verify_resources(test=test,
                                                              **kwargs)
 
+        # Use floating IP if available, otherwise use fixed IP (for IPv6-only)
+        ip_for_access = servers[0].get('fip') or servers[0].get('fixed_ip')
+        self.assertTrue(ip_for_access, "IP address is required for mtu test")
+
         if CONF.nfv_plugin_options.instance_def_gw_mtu:
             mtu = CONF.nfv_plugin_options.instance_def_gw_mtu
         else:
-            mtu = self.discover_mtu_network_size(fip=servers[0]['fip'])
+            mtu = self.discover_mtu_network_size(fip=ip_for_access)
         LOG.info('Set {} mtu for the test'.format(mtu))
 
         routers = self.os_admin.routers_client.list_routers()['routers']
@@ -268,7 +271,7 @@ class TestNfvBasic(base_test.BaseTest):
             raise ValueError('The gateway of given network does not exists. '
                              'Please assign it and re-run.')
 
-        ssh_source = self.get_remote_client(servers[0]['fip'],
+        ssh_source = self.get_remote_client(ip_for_access,
                                             username=self.instance_user,
                                             private_key=key_pair[
                                                 'private_key'])

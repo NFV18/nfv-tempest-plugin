@@ -173,18 +173,13 @@ class BaseTest(baremetal_manager.BareMetalManager):
             self.assertNotEmpty(srv['hypervisor_ip'],
                                 "_get_hypervisor_ip_from_undercloud "
                                 "returned empty ip list")
-            LOG.info('Test {} instance connectivity.'.format(srv['fip']))
-            if fip:
-                self.check_instance_connectivity(ip_addr=srv['fip'],
-                                                 user=self.instance_user,
-                                                 key_pair=key_pair[
-                                                     'private_key'])
-            else:
-                LOG.info("FIP is disabled, ping %s using network namespaces" %
-                         srv['fip'])
-                ping = self.ping_via_network_namespace(srv['fip'],
-                                                       srv['network_id'])
-                self.assertTrue(ping)
+            # Use FIP if available, otherwise use fixed IP (for IPv6-only)
+            ip_for_access = srv.get('fip') or srv.get('fixed_ip')
+            LOG.info('Test {} instance connectivity.'.format(ip_for_access))
+            # Check connectivity via SSH (works for both IPv4 with FIP and IPv6 with fixed IP)
+            self.check_instance_connectivity(ip_addr=ip_for_access,
+                                             user=self.instance_user,
+                                             key_pair=key_pair['private_key'])
 
         # Verify provider networks only when requested and if FIP is assigned
         if self.test_all_provider_networks and fip:
