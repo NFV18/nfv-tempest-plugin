@@ -74,25 +74,7 @@ NfvPluginOptions = [
                 default=False,
                 help="Verify provider networks attached to guests"),
     cfg.StrOpt('login_security_group_rules',
-               default='[{"protocol": "tcp", "direction": "ingress"'
-                       ','
-                       '"port_range_max": "22", "port_range_min": "22"'
-                       ','
-                       '"ethertype": "IPv4"}'
-                       ','
-                       '{"protocol": "icmp", "direction": "ingress"'
-                       ','
-                       '"ethertype": "IPv4"}'
-                       ','
-                       '{"protocol": "tcp", "direction": "ingress"'
-                       ','
-                       '"port_range_max": "22", "port_range_min": "22"'
-                       ','
-                       '"ethertype": "IPv6"}'
-                       ','
-                       '{"protocol": "ipv6-icmp", "direction": "ingress"'
-                       ','
-                       '"ethertype": "IPv6"}]',
+               default='[{"protocol": "tcp", "direction": "ingress", "port_range_max": "22", "port_range_min": "22", "ethertype": "IPv4"}, {"protocol": "icmp", "direction": "ingress", "ethertype": "IPv4"}, {"protocol": "tcp", "direction": "ingress", "port_range_max": "22", "port_range_min": "22", "ethertype": "IPv6"}, {"protocol": "ipv6-icmp", "direction": "ingress", "ethertype": "IPv6"}]',
                help='Configuration for test security groups.'
                     'The format is JSON. '
                     '"protocol":<icmp/udp/tcp> - string '
