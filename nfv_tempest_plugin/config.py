@@ -224,10 +224,10 @@ NfvPluginOptions = [
                help="Sleep between initial and final measure in "
                     "balance_tcp testcase"),
     cfg.DictOpt('conf_files',
-                default={'cpu_pinning_nova': '/var/lib/openstack/config/'
+                default={'cpu_pinning_nova': '/var/lib/openstack/'
                          'nova/25-cpu-pinning-nova.conf',
-                         'nova': '/var/lib/openstack/config/nova/01-nova.conf',
-                         'sriov-nova': '/var/lib/openstack/config/nova/'
+                         'nova': '/var/lib/openstack/nova/01-nova.conf',
+                         'sriov-nova': '/var/lib/openstack/nova/'
                          '03-sriov-nova.conf'},
                 help='Configuration files'),
     cfg.StrOpt('live_migration_mode',
