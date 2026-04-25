@@ -248,5 +248,11 @@ NfvPluginOptions = [
                      - priority: 4
                        protocol: 12
                """,
-               help='Default YAML configuration for DCB.')
+               help='Default YAML configuration for DCB.'),
+    cfg.StrOpt('iperf_mss',
+               default='',
+               help='TCP Maximum Segment Size for iperf3 client. '
+                    'Used to handle IPv6 GENEVE overhead in dual-stack '
+                    'environments. Leave empty to use default. '
+                    'Recommended value: 8882 for IPv6 GENEVE underlay.')
 ]

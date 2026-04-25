@@ -555,7 +555,7 @@ def iperf_server(binding_ip, binding_port, duration,
 
 
 def iperf_client(server_ip, server_port, duration,
-                 protocol, ssh_client_local, log_file=""):
+                 protocol, ssh_client_local, log_file="", mss=""):
     """execute iperf server
 
     The function executes iperf client in background mode
@@ -567,6 +567,7 @@ def iperf_client(server_ip, server_port, duration,
     :param ssh_client_local: ssh client to them vm from which
            iperf will be executed
     :param log_file: log file
+    :param mss: TCP/SCTP maximum segment size (MTU - 40 bytes)
     :return log_file: iperf output
     """
     protocols = {"tcp": "", "udp": "-u"}
@@ -576,6 +577,9 @@ def iperf_client(server_ip, server_port, duration,
                                                               server_port,
                                                               protocol,
                                                               duration)
+    if mss != "":
+        mss = "-M {}".format(mss)
+
     try:
         ssh_client_local.exec_command('which iperf')
         iperf_binary = 'iperf'
@@ -586,10 +590,10 @@ def iperf_client(server_ip, server_port, duration,
         except tempest.lib.exceptions.SSHExecCommandFailed:
             raise ValueError("iperf/iperf3 binaries were not found in $PATH")
 
-    cmd_line = "nohup sh -c \"echo -e '{} -c {} -T s2 -p {} -t {} {} " \
+    cmd_line = "nohup sh -c \"echo -e '{} {} -c {} -T s2 -p {} -t {} {} " \
                r"&\\necho pid:\$!' > iperf3c; chmod +x iperf3c;" \
                "./iperf3c\" > {} 2>&1".\
-        format(iperf_binary, server_ip, server_port, duration,
+        format(iperf_binary, mss, server_ip, server_port, duration,
                protocols[protocol], log_file)
 
     LOG.debug('Started iperf client: {}'.format(cmd_line))
