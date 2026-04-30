@@ -852,6 +852,8 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
 
         :return: List of created servers
         """
+        if fip is None:
+            fip = self.fip
         servers = []
         port = {}
 
