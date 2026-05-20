@@ -106,6 +106,13 @@ NfvPluginOptions = [
                      'checked (empty list checks every bridge found in OVS). '
                      'A bridge present in OVS but missing from exporter '
                      'metrics (instance :9105) fails the test.'),
+    cfg.StrOpt('network_exporter_state_test_bridge',
+               default='br-int',
+               help='OVS bridge used for ephemeral interface state tests.'),
+    cfg.StrOpt('network_exporter_state_test_interface',
+               default='tempest-ovs-state-test',
+               help='Name of the temporary internal OVS port created for '
+                    'interface admin/link state tests (removed after the test).'),
     cfg.BoolOpt('use_neutron_api_v2',
                 default=False,
                 help="Use neutron-tempest-plugin clients"),
