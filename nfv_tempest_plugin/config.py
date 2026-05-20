@@ -98,6 +98,14 @@ NfvPluginOptions = [
                default='/home/stack/stackrc',
                help="Full path to undercloud rc file"
                     "usually called stackrc"),
+    cfg.ListOpt('network_exporter_bridges',
+                default=['br-int'],
+                help='Optional filter of OVS bridge names to verify on compute '
+                     'hypervisors. Bridges are discovered on each hypervisor '
+                     'with "ovs-vsctl list-br" and only those in this list are '
+                     'checked (empty list checks every bridge found in OVS). '
+                     'A bridge present in OVS but missing from exporter '
+                     'metrics (instance :9105) fails the test.'),
     cfg.BoolOpt('use_neutron_api_v2',
                 default=False,
                 help="Use neutron-tempest-plugin clients"),
