@@ -36,6 +36,9 @@ OVS_BRIDGE_FLOW_COUNT_METRIC = 'ovs_bridge_flow_count'
 OVN_NORTHD_STATUS_METRIC = 'ovn_northd_status'
 OVS_INTERFACE_ADMIN_STATE_METRIC = 'ovs_interface_admin_state'
 OVS_INTERFACE_LINK_STATE_METRIC = 'ovs_interface_link_state'
+OVS_INTERFACE_MTU_BYTES_METRIC = 'ovs_interface_mtu_bytes'
+OVS_INTERFACE_LINK_SPEED_BPS_METRIC = 'ovs_interface_link_speed_bps'
+OVS_INTERFACE_LINK_RESETS_METRIC = 'ovs_interface_link_resets'
 # OVN/K8s service metrics (northd, controller, etc.), not compute :9105
 OVN_K8S_METRICS_PORT = ':1981'
 # openstack-network-exporter: 0=standby, 1=active, 2=paused
