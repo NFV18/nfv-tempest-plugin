@@ -16,8 +16,6 @@
 import time
 
 from nfv_tempest_plugin.tests.scenario.network_exporter import metrics_base
-from nfv_tempest_plugin.tests.scenario.network_exporter.test_interface_state_metrics import (  # noqa: E501
-    TestInterfaceStateMetrics)
 from oslo_log import log as logging
 
 LOG = logging.getLogger('{} [-] nfv_plugin_test'.format(__name__))
@@ -36,7 +34,7 @@ STATE_TEST_LINK_FLAP_COUNT = 2
 STATE_TEST_LINK_FLAP_SETTLE_SEC = 2
 
 
-class TestInterfaceGaugeMetrics(TestInterfaceStateMetrics):
+class TestInterfaceGaugeMetrics(metrics_base.NetworkExporterMetricsBase):
     """Verify interface MTU, link speed, and link reset metrics."""
 
     def _ovs_mtu_bytes(self, hypervisor_ip, interface):
