@@ -117,6 +117,53 @@ NfvPluginOptions = [
                help='OVS/kernel netdev for the state-test veth (max 15 characters; '
                     'Linux IFNAMSIZ). Host peer is <name> with a -h suffix when '
                     'that fits, otherwise tpst-ovs-pe.'),
+    cfg.IntOpt('network_exporter_traffic_min_bytes_per_packet',
+               default=64,
+               help='Minimum expected byte delta per counted packet when '
+                    'validating tx/rx_bytes increases.'),
+    cfg.StrOpt('network_exporter_sriov_physnet',
+               default='',
+               help='SR-IOV physnet name from tempest_config.yml test-networks '
+                    '(port_type: direct). When set, only that physnet is created '
+                    'for VM boot and ports_filter uses external,direct:<physnet>. '
+                    'Requires test-networks with mgmt, tag: external, and direct '
+                    'port_type. Must match a physical_network known to Neutron ML2.'),
+    cfg.IntOpt('network_exporter_sriov_traffic_ping_count',
+               default=150,
+               help='ICMP echo requests sent between SR-IOV guests for '
+                    'net_vf_receive/transmit_{packets,bytes}_total checks. '
+                    'Without passwordless sudo on the guest, unprivileged ping '
+                    'is limited to 200ms interval (~120s wall clock for 600 '
+                    'packets).'),
+    cfg.IntOpt('network_exporter_sriov_counter_tolerance_pct',
+               default=20,
+               help='Allowed shortfall (percent) versus '
+                    'network_exporter_sriov_traffic_ping_count when checking '
+                    'SR-IOV VF packet/byte counter growth.'),
+    cfg.IntOpt('network_exporter_sriov_rx_drop_flood_packets',
+               default=50000,
+               help='UDP datagrams sent at high rate to the SR-IOV peer IP '
+                    'without a receiver, to induce net_vf_receive_dropped_total '
+                    'increases on the receiver VF.'),
+    cfg.IntOpt('network_exporter_sriov_tx_drop_flood_packets',
+               default=10000,
+               help='UDP datagrams sent from the SR-IOV guest while the host '
+                    'VF link is disabled, to induce net_vf_transmit_dropped_total '
+                    'increases on the sender VF.'),
+    cfg.IntOpt('network_exporter_sriov_broadcast_flood_packets',
+               default=150,
+               help='UDP datagrams sent to the SR-IOV subnet broadcast address '
+                    'to drive net_vf_broadcast_packets_total on the receiver '
+                    'VF. Uses SO_BROADCAST (not ping -b) because many direct '
+                    'SR-IOV segments do not answer broadcast ICMP.'),
+    cfg.IntOpt('network_exporter_sriov_multicast_flood_packets',
+               default=150,
+               help='UDP datagrams sent to 224.0.0.1 on the SR-IOV dataplane '
+                    '(bound to the sender guest IP) to drive '
+                    'net_vf_multicast_packets_total on the receiver VF. '
+                    'Does not rely on a guest socket listener; L2 multicast '
+                    'flooding on the direct segment is enough for the NIC '
+                    'counter.'),
     cfg.BoolOpt('use_neutron_api_v2',
                 default=False,
                 help="Use neutron-tempest-plugin clients"),
