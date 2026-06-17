@@ -105,7 +105,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     self.assertTrue(stdout.strip(),
                                     'openstack metric show returned empty '
                                     'output for %s' % metric_name)
-                    LOG.warning("Metric '%s' is reported (%s bytes)",
+                    LOG.info("Metric '%s' is reported (%s bytes)",
                                 metric_name, len(stdout))
                     return stdout
             LOG.warning("Attempt %s/%s for metric '%s' failed: exit %s, "

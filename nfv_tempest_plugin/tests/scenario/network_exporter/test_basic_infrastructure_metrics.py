@@ -118,7 +118,7 @@ class TestBasicInfrastructureMetrics(metrics_base.NetworkExporterMetricsBase):
             ovs_bridges = self._list_ovs_bridges_on_hypervisor(hypervisor_ip)
             bridges = self._bridges_to_verify_on_hypervisor(
                 hypervisor_ip, ovs_bridges)
-            LOG.warning(
+            LOG.info(
                 "Hypervisor %s OVS bridges %s; verifying %s for metric %s",
                 hypervisor_ip, ovs_bridges, bridges, metric_name)
             for bridge in bridges:
@@ -150,7 +150,7 @@ class TestBasicInfrastructureMetrics(metrics_base.NetworkExporterMetricsBase):
                         [line for line in metric_stdout.splitlines()
                          if '|' in line and bridge in line
                          and hypervisor_ip in line][:3]))
-                LOG.warning(
+                LOG.info(
                     "Metric '%s' bridge '%s' on %s matches OVS count %s",
                     metric_name, bridge, hypervisor_ip, expected)
         self.assertTrue(
@@ -200,5 +200,5 @@ class TestBasicInfrastructureMetrics(metrics_base.NetworkExporterMetricsBase):
             OVN_NORTHD_STATUS_ACTIVE, values,
             "Metric '%s' has no active northd (value 1); reported %s" % (
                 OVN_NORTHD_STATUS_METRIC, values))
-        LOG.warning("Metric '%s' reported values: %s",
+        LOG.info("Metric '%s' reported values: %s",
                     OVN_NORTHD_STATUS_METRIC, values)
