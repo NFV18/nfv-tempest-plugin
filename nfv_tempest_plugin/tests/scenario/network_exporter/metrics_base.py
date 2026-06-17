@@ -49,8 +49,60 @@ OVS_INTERFACE_LINK_STATE_METRIC = 'ovs_interface_link_state'
 OVS_INTERFACE_MTU_BYTES_METRIC = 'ovs_interface_mtu_bytes'
 OVS_INTERFACE_LINK_SPEED_BPS_METRIC = 'ovs_interface_link_speed_bps'
 OVS_INTERFACE_LINK_RESETS_METRIC = 'ovs_interface_link_resets'
+OVS_INTERFACE_RX_PACKETS_METRIC = 'ovs_interface_rx_packets'
+OVS_INTERFACE_TX_PACKETS_METRIC = 'ovs_interface_tx_packets'
+OVS_INTERFACE_RX_BYTES_METRIC = 'ovs_interface_rx_bytes'
+OVS_INTERFACE_TX_BYTES_METRIC = 'ovs_interface_tx_bytes'
+OVS_INTERFACE_STAT_TO_METRIC = {
+    'rx_packets': OVS_INTERFACE_RX_PACKETS_METRIC,
+    'tx_packets': OVS_INTERFACE_TX_PACKETS_METRIC,
+    'rx_bytes': OVS_INTERFACE_RX_BYTES_METRIC,
+    'tx_bytes': OVS_INTERFACE_TX_BYTES_METRIC,
+}
+NET_VF_INFO_METRIC = 'net_vf_info'
+NET_VF_RECEIVE_PACKETS_METRIC = 'net_vf_receive_packets_total'
+NET_VF_TRANSMIT_PACKETS_METRIC = 'net_vf_transmit_packets_total'
+NET_VF_RECEIVE_BYTES_METRIC = 'net_vf_receive_bytes_total'
+NET_VF_TRANSMIT_BYTES_METRIC = 'net_vf_transmit_bytes_total'
+NET_VF_RECEIVE_DROPPED_METRIC = 'net_vf_receive_dropped_total'
+NET_VF_TRANSMIT_DROPPED_METRIC = 'net_vf_transmit_dropped_total'
+NET_VF_BROADCAST_PACKETS_METRIC = 'net_vf_broadcast_packets_total'
+NET_VF_MULTICAST_PACKETS_METRIC = 'net_vf_multicast_packets_total'
+NET_VF_COUNTER_METRICS = (
+    NET_VF_RECEIVE_PACKETS_METRIC,
+    NET_VF_TRANSMIT_PACKETS_METRIC,
+    NET_VF_RECEIVE_BYTES_METRIC,
+    NET_VF_TRANSMIT_BYTES_METRIC,
+    NET_VF_BROADCAST_PACKETS_METRIC,
+    NET_VF_MULTICAST_PACKETS_METRIC,
+)
+NET_VF_ALL_METRICS = (
+    NET_VF_INFO_METRIC,
+    NET_VF_RECEIVE_PACKETS_METRIC,
+    NET_VF_TRANSMIT_PACKETS_METRIC,
+    NET_VF_RECEIVE_BYTES_METRIC,
+    NET_VF_TRANSMIT_BYTES_METRIC,
+    NET_VF_RECEIVE_DROPPED_METRIC,
+    NET_VF_TRANSMIT_DROPPED_METRIC,
+    NET_VF_BROADCAST_PACKETS_METRIC,
+    NET_VF_MULTICAST_PACKETS_METRIC,
+)
+# Host sysfs under .../sriov/vfN/stats/ (same source as net_vf exporter).
+NET_VF_METRIC_TO_SYSFS_STAT = {
+    NET_VF_RECEIVE_PACKETS_METRIC: 'rx_packets',
+    NET_VF_TRANSMIT_PACKETS_METRIC: 'tx_packets',
+    NET_VF_RECEIVE_BYTES_METRIC: 'rx_bytes',
+    NET_VF_TRANSMIT_BYTES_METRIC: 'tx_bytes',
+    NET_VF_RECEIVE_DROPPED_METRIC: 'rx_dropped',
+    NET_VF_TRANSMIT_DROPPED_METRIC: 'tx_dropped',
+}
 # OVN/K8s service metrics (northd, controller, etc.), not compute :9105
 OVN_K8S_METRICS_PORT = ':1981'
+PROM_METRIC_LINE_RE = re.compile(
+    r'^(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
+    r'\{(?P<labels>[^}]*)\}\s+'
+    r'(?P<value>-?\d+(?:\.\d+)?)$')
+PROM_LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 # openstack-network-exporter: 0=standby, 1=active, 2=paused
 OVN_NORTHD_STATUS_VALUES = (0, 1, 2)
 OVN_NORTHD_STATUS_ACTIVE = 1
@@ -69,6 +121,9 @@ LEGACY_STATE_TEST_INTERFACES = (
     'tempest-ovs-state-test',
     'tempest-ovs-state-test-host',
 )
+PING_FAST_INTERVAL_SEC = 0.001
+PING_SLOW_INTERVAL_SEC = 0.2
+PING_MAX_WALL_SECONDS = 120
 
 
 class NetworkExporterMetricsBase(base_test.BaseTest):
@@ -142,6 +197,47 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             return data.get('data', {}).get('result', []), ''
         return None, '; '.join(errors) or 'Prometheus query failed'
 
+    def _fetch_metric_storage_promql_results(self, metric_name):
+        """Query metric-storage Prometheus for instant vector samples."""
+        query = 'last_over_time(%s[5m])' % metric_name
+        results, error = self._query_prometheus(query)
+        if results:
+            return results, ''
+        return [], error or 'metric-storage query failed'
+
+    def _sample_matches_hypervisor(self, labels, hypervisor_ip):
+        """True when a metric-storage sample belongs to hypervisor_ip."""
+        row_text = ' '.join(
+            labels.get(key, '') for key in ('instance', 'fqdn', 'hostname'))
+        for ident in self._hypervisor_identifiers(hypervisor_ip):
+            ident_short = ident.split('.')[0]
+            if ident in row_text or ident_short in row_text:
+                return True
+        return False
+
+    def _metric_storage_samples(self, metric_name, hypervisor_ip=None,
+                                required_labels=None):
+        """Return metric-storage samples filtered by hypervisor and labels."""
+        results, error = self._fetch_metric_storage_promql_results(metric_name)
+        samples = []
+        for result in results:
+            labels = result.get('metric', {})
+            value = result.get('value', [None, None])[1]
+            if value is None:
+                continue
+            if (hypervisor_ip and
+                    not self._sample_matches_hypervisor(labels, hypervisor_ip)):
+                continue
+            if required_labels and any(
+                    labels.get(key) != val
+                    for key, val in required_labels.items()):
+                continue
+            samples.append({
+                'labels': labels,
+                'value': int(float(value)),
+            })
+        return samples, error
+
     def _metric_show(self, metric_name):
         """Query metric-storage Prometheus for metric values."""
         query = 'last_over_time(%s[5m])' % metric_name
@@ -157,6 +253,105 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         except Exception as exc:
             LOG.warning("Prometheus query error: %s", exc)
             return '', str(exc), 1
+
+    def _scrape_compute_metrics_text(self, hypervisor_ip):
+        """Return openstack-network-exporter Prometheus text from a compute node."""
+        cmd_https = "curl -sk https://127.0.0.1:9105/metrics 2>/dev/null"
+        metrics_output = self._ssh_run_on_hypervisor(hypervisor_ip, cmd_https)
+        if metrics_output.strip():
+            return metrics_output
+        cmd_http = "curl -s http://127.0.0.1:9105/metrics 2>/dev/null"
+        return self._ssh_run_on_hypervisor(hypervisor_ip, cmd_http)
+
+    def _guest_has_passwordless_sudo(self, ssh_client):
+        """Return True when the guest accepts ``sudo -n`` without prompting."""
+        try:
+            ssh_client.exec_command('sudo -n true')
+            return True
+        except Exception:
+            return False
+
+    def _send_ping_packets(self, ssh_client, dest_ip, count, min_packets):
+        """Send ICMP echo requests between guests for traffic counter tests.
+
+        Unprivileged ``ping -i 0.001`` is rejected on RHEL/iputils (200ms floor).
+        When passwordless sudo is unavailable, fall back to ``-i 0.2`` bounded by
+        ``PING_MAX_WALL_SECONDS`` so SSH exec does not time out.
+        """
+        errors = []
+        if self._guest_has_passwordless_sudo(ssh_client):
+            for template in (
+                    'timeout %d sudo -n ping -c %d -i %g -W 2 %s',
+                    'ping -c %d -i %g -W 2 %s'):
+                if 'sudo' in template:
+                    wall = max(30, int(count * PING_FAST_INTERVAL_SEC) + 15)
+                    cmd = template % (
+                        wall, count, PING_FAST_INTERVAL_SEC, dest_ip)
+                else:
+                    cmd = template % (
+                        count, PING_FAST_INTERVAL_SEC, dest_ip)
+                LOG.warning('Sending dataplane ping: %s', cmd)
+                try:
+                    output = ssh_client.exec_command(cmd)
+                except Exception as exc:
+                    errors.append('%s -> %s' % (cmd, exc))
+                    continue
+                if '100% packet loss' in (output or ''):
+                    errors.append('%s -> 100%% packet loss' % cmd)
+                    continue
+                return output
+
+        slow_count = min(
+            count,
+            int(PING_MAX_WALL_SECONDS / PING_SLOW_INTERVAL_SEC))
+        if slow_count < min_packets:
+            self.fail(
+                'Cannot send %d ICMP replies (need >=%d) within %ds without '
+                'passwordless sudo on the guest. Lower the traffic ping count '
+                'to <= %d (at %.1fs interval) or grant passwordless sudo for '
+                'ping.' % (
+                    count, min_packets, PING_MAX_WALL_SECONDS, slow_count,
+                    PING_SLOW_INTERVAL_SEC))
+        wall = int(slow_count * PING_SLOW_INTERVAL_SEC) + 15
+        cmd = 'timeout %d ping -c %d -i %g -W 2 %s' % (
+            wall, slow_count, PING_SLOW_INTERVAL_SEC, dest_ip)
+        LOG.warning('Sending dataplane ping (slow path): %s', cmd)
+        try:
+            output = ssh_client.exec_command(cmd)
+        except Exception as exc:
+            errors.append('%s -> %s' % (cmd, exc))
+        else:
+            if '100% packet loss' not in (output or ''):
+                return output
+            errors.append('%s -> 100%% packet loss' % cmd)
+        if errors:
+            detail = '; '.join(errors)
+        else:
+            detail = 'slow ping path failed'
+        self.fail('Ping to %s failed: %s' % (dest_ip, detail))
+
+    def _assert_metric_on_compute_scrape(self, metric_name):
+        """Verify metric_name is exported on at least one compute :9105 scrape."""
+        hypervisors = self._get_hypervisor_ip_from_undercloud()
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisor IPs available for :9105 scrape')
+        found_on = []
+        for hypervisor_ip in hypervisors:
+            for line in self._scrape_compute_metrics_text(
+                    hypervisor_ip).splitlines():
+                stripped = line.strip()
+                if stripped.startswith(metric_name + '{') or stripped.startswith(
+                        metric_name + ' '):
+                    found_on.append(hypervisor_ip)
+                    break
+        self.assertNotEmpty(
+            found_on,
+            "Metric '%s' not found on :9105 scrape from hypervisors %s" % (
+                metric_name, hypervisors))
+        LOG.warning(
+            "Metric '%s' found on compute :9105 scrape from %s",
+            metric_name, found_on)
 
     def _assert_metric_reported(self, metric_name, output_markers=None):
         """Wait until metric_name is present in metric-storage Prometheus."""
@@ -780,3 +975,22 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             self._delete_test_interface, hypervisor_ip, bridge, interface)
         self._ensure_port_up(hypervisor_ip, interface)
         return hypervisor_ip, interface
+
+    def _parse_prom_samples(self, metrics_output, metric_name,
+                            required_labels=None):
+        """Parse Prometheus exposition text into label/value samples."""
+        samples = []
+        for line in (metrics_output or '').splitlines():
+            match = PROM_METRIC_LINE_RE.match(line.strip())
+            if not match or match.group('metric') != metric_name:
+                continue
+            labels = dict(PROM_LABEL_RE.findall(match.group('labels')))
+            if required_labels and any(
+                    labels.get(key) != value
+                    for key, value in required_labels.items()):
+                continue
+            samples.append({
+                'labels': labels,
+                'value': int(float(match.group('value'))),
+            })
+        return samples

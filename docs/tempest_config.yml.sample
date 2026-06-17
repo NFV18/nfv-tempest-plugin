@@ -67,15 +67,15 @@ test-networks:
     network_type: vlan
     ip_version: 4
     port_type: direct
-    # Nova will set the binding profile of this port to trusted=true and will
-    # set it as Trusted VF
-    trusted_vf: true
-    # set if using HW-Offload port when OVS in is in switchdev mode
-    switchdev: true
-    # set on SRIOV nics support.
-    min_qos: true
-    # (Optional) - Do not attach the network to the instance by default
-    skip_srv_attach: true
+    # network_exporter_sriov_vf_metrics: set skip_srv_attach false (or omit).
+    # Do not set trusted_vf/switchdev unless your Nova PCI whitelist requires them.
+
+# Per-test flavor/image selection (optional). When omitted, compute.flavor_ref is used.
+# network_exporter_sriov_vf_metrics also needs a direct test-network (see above) and
+# [nfv_plugin_options] network_exporter_sriov_physnet matching its physical_network.
+tests-setup:
+  - name: network_exporter_sriov_vf_metrics
+    flavor: nfv_qe_base_flavor
 
 # Flavors used by the test.
 # Will be created by the tests during the execution
