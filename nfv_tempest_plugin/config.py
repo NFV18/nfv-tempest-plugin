@@ -117,6 +117,15 @@ NfvPluginOptions = [
                help='OVS/kernel netdev for the state-test veth (max 15 characters; '
                     'Linux IFNAMSIZ). Host peer is <name> with a -h suffix when '
                     'that fits, otherwise tpst-ovs-pe.'),
+    cfg.IntOpt('network_exporter_traffic_ping_count',
+               default=5000,
+               help='ICMP echo requests sent between two test VMs for '
+                    'ovs_interface_rx/tx_packets/bytes validation.'),
+    cfg.IntOpt('network_exporter_traffic_packet_tolerance_pct',
+               default=15,
+               help='Allowed shortfall (percent) versus '
+                    'network_exporter_traffic_ping_count when comparing '
+                    'OVS counter deltas.'),
     cfg.IntOpt('network_exporter_traffic_min_bytes_per_packet',
                default=64,
                help='Minimum expected byte delta per counted packet when '
