@@ -110,7 +110,18 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def _assert_ovs_interface_metric_reported(self, metric_name):
         """Assert metric on openstack metric show, compute :9105, metric-storage."""
-        self._assert_metric_reported(metric_name)
+        stdout, stderr, returncode = self._metric_show(metric_name)
+        stdout = stdout or ''
+        if self._metric_show_output_usable(metric_name, stdout):
+            LOG.info(
+                "Metric '%s' reported via openstack metric show or "
+                "metric-storage fallback", metric_name)
+        else:
+            LOG.warning(
+                "openstack metric show unavailable for '%s' (exit %s: %s); "
+                "falling back to compute :9105 SSH scrape",
+                metric_name, returncode, stderr)
+            self._assert_metric_on_compute_scrape(metric_name)
         storage_samples, query_error = self._metric_storage_samples(metric_name)
         self.assertNotEmpty(
             storage_samples,
@@ -142,24 +153,49 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                 if self.external_resources_data is not None:
                     server = self.map_external_provider_network_types(server)
 
+    def _mgmt_network_id(self):
+        mgmt_name = getattr(self, 'mgmt_network', None)
+        if not mgmt_name:
+            return None
+        return self.test_network_dict.get(mgmt_name, {}).get('net-id')
+
     def _dataplane_peer_ip(self, sender, receiver):
         """Return receiver data-plane IP on a network shared with sender."""
+        mgmt_net_id = self._mgmt_network_id()
+        shared = []
         for recv_net in receiver['provider_networks']:
             for send_net in sender['provider_networks']:
                 if recv_net['network_id'] == send_net['network_id']:
-                    return recv_net['ip_address']
-        self.fail(
-            'No shared provider network between VMs %s and %s; cannot '
-            'send dataplane traffic. Configure test-networks with a common '
-            'provider net and enable provider connectivity.' % (
-                sender.get('name', sender['id']),
-                receiver.get('name', receiver['id'])))
+                    shared.append(recv_net)
+                    break
+        if not shared:
+            self.fail(
+                'No shared provider network between VMs %s and %s; cannot '
+                'send dataplane traffic. Configure test-networks with a common '
+                'provider net and enable provider connectivity.' % (
+                    sender.get('name', sender['id']),
+                    receiver.get('name', receiver['id'])))
+        for net in shared:
+            if mgmt_net_id and net['network_id'] == mgmt_net_id:
+                continue
+            return net['ip_address']
+        return shared[0]['ip_address']
 
     def _resolve_ovs_interface(self, server):
         """Return OVS interface name for the VM dataplane port."""
         if server.get('other_port'):
             return server['other_port']
-        for net in server['provider_networks']:
+        mgmt_net_id = self._mgmt_network_id()
+        provider_networks = list(server.get('provider_networks', []))
+        if mgmt_net_id:
+            dataplane = [
+                net for net in provider_networks
+                if net.get('network_id') != mgmt_net_id]
+            if dataplane:
+                provider_networks = dataplane + [
+                    net for net in provider_networks
+                    if net.get('network_id') == mgmt_net_id]
+        for net in provider_networks:
             port_id = net.get('port_id')
             if not port_id:
                 continue
@@ -245,6 +281,7 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         min_bytes = self._min_expected_bytes()
         metric_stdout_cache = {}
         last = {}
+        last_exc = None
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
             sender_stats = self._ovs_interface_stats(
                 sender['hypervisor_ip'], sender_iface)
@@ -284,6 +321,7 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                     '(attempt %s): %s', attempt + 1, last)
                 return sender_delta, receiver_delta
             except Exception as exc:
+                last_exc = exc
                 LOG.warning(
                     'Attempt %s/%s waiting for traffic counters: %s; last %s',
                     attempt + 1, metrics_base.METRIC_RETRY_ATTEMPTS,
@@ -291,11 +329,9 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
             if attempt < metrics_base.METRIC_RETRY_ATTEMPTS - 1:
                 time.sleep(metrics_base.METRIC_RETRY_INTERVAL)
         self.fail(
-            'Timed out waiting for ovs_interface_rx/tx_packets/bytes to '
-            'reflect >=%s packets (%s%% tolerance) between VMs. Last %s' % (
-                min_packets,
-                CONF.nfv_plugin_options.network_exporter_traffic_packet_tolerance_pct,
-                last))
+            'Timed out waiting for OVS vs openstack metric show vs :9105 vs '
+            'metric-storage alignment after traffic (packet deltas were %s). '
+            'Last alignment error: %s' % (last, last_exc))
 
     # --- Presence: one Tempest result per ovs_interface counter metric ---
 

@@ -238,6 +238,16 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             })
         return samples, error
 
+    def _metric_show_output_usable(self, metric_name, stdout):
+        """True when pod exec or PromQL output contains metric_name samples."""
+        stdout = stdout or ''
+        return bool(stdout.strip()) and metric_name in stdout
+
+    def _metric_show_output_usable(self, metric_name, stdout):
+        """True when PromQL output contains metric_name samples."""
+        stdout = stdout or ''
+        return bool(stdout.strip()) and metric_name in stdout
+
     def _metric_show(self, metric_name):
         """Query metric-storage Prometheus for metric values."""
         query = 'last_over_time(%s[5m])' % metric_name
@@ -249,6 +259,9 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 LOG.warning("Prometheus query failed: %s", error)
                 return '', error, 1
             stdout = self._prometheus_results_to_table(results)
+            if not self._metric_show_output_usable(metric_name, stdout):
+                return '', (
+                    'metric-storage returned no samples for %s' % metric_name), 1
             return stdout, '', 0
         except Exception as exc:
             LOG.warning("Prometheus query error: %s", exc)
