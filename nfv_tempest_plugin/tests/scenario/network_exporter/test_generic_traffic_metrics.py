@@ -231,27 +231,21 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                 'interface %s' % (metric_name, hypervisor_ip, interface))
         return samples[0]['value']
 
-    def _assert_counters_match_ovs(self, hypervisor_ip, interface, ovs_stats,
-                                   metric_stdout_cache):
-        """Assert openstack metric show, :9105, and metric-storage match OVS."""
+    def _assert_counters_match_ovs(self, hypervisor_ip, interface, ovs_stats):
+        """Assert compute :9105 and metric-storage match OVS Interface stats.
+
+        openstack metric show is not checked per-interface: VM vhostuser ports
+        (e.g. vhu*) are not broken out in gnocchi rows the way ephemeral test
+        veths are in gauge tests.
+        """
         labels = {'interface': interface}
         for stat_key, metric_name in (
                 metrics_base.OVS_INTERFACE_STAT_TO_METRIC.items()):
             ovs_value = int(ovs_stats[stat_key])
-            if metric_name not in metric_stdout_cache:
-                metric_stdout_cache[metric_name], _, _ = self._metric_show(
-                    metric_name)
-            reported = self._parse_compute_metric_show_value(
-                metric_stdout_cache[metric_name], metric_name,
-                hypervisor_ip, row_contains=interface)
             prom = self._prom_compute_metric_value(
                 hypervisor_ip, metric_name, labels)
             storage = self._storage_counter_value(
                 hypervisor_ip, metric_name, interface)
-            self.assertIsNotNone(
-                reported,
-                '%s missing row for %s on %s in openstack metric show' % (
-                    metric_name, interface, hypervisor_ip))
             self.assertIsNotNone(
                 prom,
                 '%s missing on :9105 for %s on %s' % (
@@ -261,12 +255,8 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                 '%s missing in metric-storage for %s on %s' % (
                     metric_name, interface, hypervisor_ip))
             self.assertEqual(
-                ovs_value, reported,
-                '%s openstack metric show=%s OVS=%s for %s on %s' % (
-                    metric_name, reported, ovs_value, interface, hypervisor_ip))
-            self.assertEqual(
                 ovs_value, prom,
-                '%s prom=%s OVS=%s for %s on %s' % (
+                '%s :9105=%s OVS=%s for %s on %s' % (
                     metric_name, prom, ovs_value, interface, hypervisor_ip))
             self.assertEqual(
                 ovs_value, storage,
@@ -279,7 +269,6 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         """Wait until OVS and exporter counters reflect the ping run."""
         min_packets = self._min_expected_packets()
         min_bytes = self._min_expected_bytes()
-        metric_stdout_cache = {}
         last = {}
         last_exc = None
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
@@ -311,11 +300,9 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                     receiver_delta['rx_bytes'], min_bytes,
                     'receiver rx_bytes delta %s' % receiver_delta)
                 self._assert_counters_match_ovs(
-                    sender['hypervisor_ip'], sender_iface, sender_stats,
-                    metric_stdout_cache)
+                    sender['hypervisor_ip'], sender_iface, sender_stats)
                 self._assert_counters_match_ovs(
-                    receiver['hypervisor_ip'], receiver_iface, receiver_stats,
-                    metric_stdout_cache)
+                    receiver['hypervisor_ip'], receiver_iface, receiver_stats)
                 LOG.warning(
                     'Interface counters consistent after traffic '
                     '(attempt %s): %s', attempt + 1, last)
@@ -329,8 +316,8 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
             if attempt < metrics_base.METRIC_RETRY_ATTEMPTS - 1:
                 time.sleep(metrics_base.METRIC_RETRY_INTERVAL)
         self.fail(
-            'Timed out waiting for OVS vs openstack metric show vs :9105 vs '
-            'metric-storage alignment after traffic (packet deltas were %s). '
+            'Timed out waiting for OVS vs :9105 vs metric-storage alignment '
+            'after traffic (packet deltas were %s). '
             'Last alignment error: %s' % (last, last_exc))
 
     # --- Presence: one Tempest result per ovs_interface counter metric ---
