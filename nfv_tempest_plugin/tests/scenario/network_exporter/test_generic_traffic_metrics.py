@@ -15,6 +15,7 @@
 #    under the License.
 
 import time
+import unittest
 
 from tempest import config
 
@@ -31,6 +32,68 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
     """Verify ovs_interface rx/tx packet and byte counters with VM traffic."""
 
     TEST_NAME = 'network_exporter_generic_traffic'
+
+    def _ensure_test_setup(self):
+        """Default test config when tests-setup omits this test name."""
+        if self.TEST_NAME not in self.test_setup_dict:
+            self.test_setup_dict[self.TEST_NAME] = {
+                'flavor-id': self.flavor_ref,
+                'router': True,
+                'aggregate': None,
+            }
+
+    def _filter_generic_traffic_test_networks(self, test_networks):
+        """Keep mgmt + normal OVS dataplane networks; skip direct SR-IOV ports."""
+        filtered = []
+        for network in test_networks:
+            if network.get('mgmt'):
+                filtered.append(network)
+                continue
+            if network.get('port_type') == 'direct':
+                continue
+            filtered.append(network)
+        if not any(not net.get('mgmt') for net in filtered):
+            raise unittest.SkipTest(
+                'No shared normal provider test-network in tempest_config.yml '
+                'for %s. Add a test-network with port_type: normal (e.g. '
+                'tag: external) in addition to mgmt.' % self.TEST_NAME)
+        LOG.warning(
+            'Generic traffic metrics will create test-networks: %s',
+            [net.get('name') for net in filtered])
+        return filtered
+
+    def _build_generic_traffic_boot_kwargs(self):
+        """Boot kwargs: mgmt router only, normal + external ports for dataplane."""
+        ports_filter = 'external,normal'
+        srv_details = {
+            0: {'ports_filter': ports_filter},
+            1: {'ports_filter': ports_filter},
+        }
+        hypervisor = CONF.nfv_plugin_options.target_hypervisor
+        if hypervisor:
+            for index in srv_details:
+                srv_details[index]['availability_zone'] = 'nova:%s' % hypervisor
+        return {
+            'num_servers': 2,
+            'mgmt_subnet_only': True,
+            'srv_details': srv_details,
+        }
+
+    def _boot_generic_traffic_vms(self):
+        """Create networks, ports, and boot two VMs for dataplane traffic."""
+        self._ensure_test_setup()
+        boot_kwargs = self._build_generic_traffic_boot_kwargs()
+        LOG.warning(
+            'Booting VMs for %s with ports_filter=%s mgmt_subnet_only=True',
+            self.TEST_NAME, boot_kwargs['srv_details'][0]['ports_filter'])
+        full_test_networks = self.external_config['test-networks']
+        self.external_config['test-networks'] = (
+            self._filter_generic_traffic_test_networks(full_test_networks))
+        try:
+            return self.create_and_verify_resources(
+                test=self.TEST_NAME, **boot_kwargs)
+        finally:
+            self.external_config['test-networks'] = full_test_networks
 
     def _traffic_ping_count(self):
         return CONF.nfv_plugin_options.network_exporter_traffic_ping_count
@@ -260,8 +323,7 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def test_ovs_interface_rx_tx_counters_with_vm_traffic(self):
         """Boot two VMs, send ICMP traffic, verify interface rx/tx metrics."""
-        servers, key_pair = self.create_and_verify_resources(
-            test=self.TEST_NAME, num_servers=2)
+        servers, key_pair = self._boot_generic_traffic_vms()
         self.assertEqual(2, len(servers),
                          'Test requires exactly two VMs')
 

@@ -75,10 +75,11 @@ test-networks:
 # [nfv_plugin_options] network_exporter_sriov_physnet matching its physical_network.
 # network_exporter_generic_traffic boots two VMs on a shared provider network (mgmt plus
 # at least one non-SR-IOV dataplane network with L2/L3 connectivity between them,
-# typically port_type: normal such as vlan1500 above). No direct port or
-# network_exporter_sriov_physnet is required. Guests need passwordless sudo for fast
-# ICMP (network_exporter_traffic_ping_count defaults to 5000); otherwise lower the
-# ping count or grant sudo in the guest image.
+# typically port_type: normal such as vlan1500 above). Direct (SR-IOV) test-networks
+# are skipped automatically. Only the mgmt subnet is attached to the router (dataplane
+# uses L2); this avoids Neutron BadRequest when multiple subnets share a CIDR.
+# Guests need passwordless sudo for fast ICMP (network_exporter_traffic_ping_count
+# defaults to 5000); otherwise lower the ping count or grant sudo in the guest image.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor
