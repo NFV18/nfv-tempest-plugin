@@ -362,11 +362,15 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             '%s metric-storage=%s OVS=%s for %s on %s' % (
                 metric_name, storage, ovs_value, interface, hypervisor_ip))
 
-    def _flood_udp_dataplane(self, ssh_client, bind_ip, dest_ip, packet_count):
+    def _flood_udp_dataplane(self, ssh_client, bind_ip, dest_ip, packet_count,
+                             broadcast=False):
+        bcast = 'True' if broadcast else 'False'
         script = (
             'import socket\n'
             's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
             's.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)\n'
+            'if %s:\n'
+            '    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)\n'
             's.bind((%r, 0))\n'
             'payload = b"x" * 1400\n'
             'dest = (%r, 9999)\n'
@@ -375,8 +379,18 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             '        s.sendto(payload, dest)\n'
             '    except OSError:\n'
             '        pass\n'
-            % (bind_ip, dest_ip, packet_count))
+            % (bcast, bind_ip, dest_ip, packet_count))
         self._run_guest_python_script(ssh_client, script, timeout_sec=180)
+
+    def _kernel_iface_stat(self, hypervisor_ip, iface, stat):
+        out = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'cat /sys/class/net/%s/statistics/%s 2>/dev/null' % (
+                iface, stat)).strip()
+        try:
+            return int(out)
+        except (TypeError, ValueError):
+            return 0
 
     def _prepare_traffic_context(self):
         servers, key_pair = self._boot_error_test_vms()
@@ -475,26 +489,66 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
     def _ensure_veth_port_up(self, hypervisor_ip, iface):
         """Bring both veth legs and OVS admin up without coupling link toggles."""
         peer = self._veth_peer_name(iface)
+        self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'sudo ip link set dev %s mtu 1500 2>/dev/null || true; '
+            'sudo ip link set dev %s mtu 1500 2>/dev/null || true' % (
+                iface, peer))
         self._set_kernel_link_state(hypervisor_ip, peer, 'up')
         self._set_kernel_link_state(hypervisor_ip, iface, 'up')
         self._set_ovs_admin_db_only(hypervisor_ip, iface, 'up')
+        self._clear_ovs_ingress_policing(hypervisor_ip, iface)
         self._ssh_run_on_hypervisor(
             hypervisor_ip,
             'sudo ovs-vsctl set Interface %s link_state=up' % iface)
 
-    def _install_tc_ingress_drop(self, hypervisor_ip, iface):
-        """Drop all ingress on the OVS netdev (increments kernel rx_dropped)."""
+    def _set_ovs_ingress_policing(self, hypervisor_ip, iface, rate, burst):
         self._ssh_run_on_hypervisor(
             hypervisor_ip,
-            'sudo tc qdisc add dev %s handle ffff: ingress 2>/dev/null || true; '
-            'sudo tc filter add dev %s parent ffff: protocol all u32 '
-            'match u32 0 0 action drop 2>/dev/null || true' % (iface, iface))
-        self.addCleanup(self._remove_tc_ingress, hypervisor_ip, iface)
+            'sudo ovs-vsctl set Interface %s ingress_policing_rate=%d '
+            'ingress_policing_burst=%d' % (iface, rate, burst))
 
-    def _remove_tc_ingress(self, hypervisor_ip, iface):
+    def _clear_ovs_ingress_policing(self, hypervisor_ip, interface):
+        self._ssh_run_on_hypervisor(
+            hypervisor_ip,
+            'sudo ovs-vsctl set Interface %s ingress_policing_rate=0 '
+            'ingress_policing_burst=0' % interface)
+
+    def _try_install_tc_ingress_drop(self, hypervisor_ip, iface):
+        """Install an ingress drop filter; return False when tc is unavailable."""
         self._ssh_run_unchecked_on_hypervisor(
             hypervisor_ip,
-            'sudo tc qdisc del dev %s ingress 2>/dev/null || true' % iface)
+            'sudo modprobe sch_ingress cls_u32 act_gact 2>/dev/null || true')
+        out = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'sudo tc qdisc add dev %s handle ffff: ingress 2>&1; '
+            'echo __ingress__:$?' % iface)
+        if '__ingress__:0' not in out and 'exists' not in out.lower():
+            out = self._ssh_run_unchecked_on_hypervisor(
+                hypervisor_ip,
+                'sudo tc qdisc add dev %s clsact 2>&1; echo __clsact__:$?' % (
+                    iface))
+            if '__clsact__:0' not in out and 'exists' not in out.lower():
+                LOG.warning(
+                    'tc ingress/clsact unavailable on %s for %s: %s',
+                    hypervisor_ip, iface, out.strip())
+                return False
+        out = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'sudo tc filter add dev %s parent ffff: protocol all u32 '
+            'match u32 0 0 action drop 2>&1; echo __filter__:$?' % iface)
+        if '__filter__:0' not in out:
+            out = self._ssh_run_unchecked_on_hypervisor(
+                hypervisor_ip,
+                'sudo tc filter add dev %s ingress protocol all u32 '
+                'match u32 0 0 action drop 2>&1; echo __filter__:$?' % iface)
+            if '__filter__:0' not in out:
+                LOG.warning(
+                    'tc ingress drop filter unavailable on %s for %s: %s',
+                    hypervisor_ip, iface, out.strip())
+                return False
+        self.addCleanup(self._remove_tc_ingress, hypervisor_ip, iface)
+        return True
 
     def _try_install_tc_netem(self, hypervisor_ip, iface, netem_opts):
         """Install a netem root qdisc; return False if sch_netem is unavailable."""
@@ -546,32 +600,55 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             hypervisor_ip,
             'sudo tc qdisc del dev %s root 2>/dev/null || true' % iface)
 
+    def _remove_tc_ingress(self, hypervisor_ip, iface):
+        self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'sudo tc qdisc del dev %s ingress 2>/dev/null || true; '
+            'sudo tc qdisc del dev %s clsact 2>/dev/null || true' % (
+                iface, iface))
+
     def _induce_rx_dropped_on_iface(self, hypervisor_ip, iface, peer,
                                     peer_ip, iface_ip, flood_count, baseline,
-                                    label):
+                                    label, vm_ctx=None):
         """Flood the OVS leg from the host peer; return exporter-mapped delta."""
         self._hypervisor_ping_flood(
             hypervisor_ip, peer, iface_ip, flood_count)
         self._hypervisor_udp_flood(
             hypervisor_ip, peer, peer_ip, iface_ip, flood_count)
+        if vm_ctx:
+            self._flood_udp_dataplane(
+                vm_ctx['ssh_sender'], vm_ctx['bind_ip'], iface_ip,
+                flood_count)
         after = self._ovs_interface_stats(hypervisor_ip, iface)
         return self._log_error_induce_stats(label, baseline, after, 'rx_dropped')
 
     def _induce_veth_rx_dropped(self, hypervisor_ip, iface, peer, peer_ip,
-                                iface_ip, flood_count):
+                                iface_ip, flood_count, vm_ctx=None):
         """Drop inbound traffic on the OVS port while the host peer stays up."""
         self._ensure_veth_port_up(hypervisor_ip, iface)
         baseline = self._ovs_interface_stats(hypervisor_ip, iface)
 
-        self._install_tc_ingress_drop(hypervisor_ip, iface)
+        self._set_ovs_ingress_policing(hypervisor_ip, iface, 100, 10)
+        self.addCleanup(self._clear_ovs_ingress_policing, hypervisor_ip, iface)
         time.sleep(1)
         LOG.warning(
-            'Veth rx_dropped induce: tc ingress drop on %s, flood from %s',
+            'Veth rx_dropped induce: OVS ingress policing on %s, flood from %s',
             iface, peer)
         delta = self._induce_rx_dropped_on_iface(
             hypervisor_ip, iface, peer, peer_ip, iface_ip, flood_count,
-            baseline, 'Veth RX tc ingress drop')
-        self._remove_tc_ingress(hypervisor_ip, iface)
+            baseline, 'Veth RX OVS policing', vm_ctx=vm_ctx)
+        self._clear_ovs_ingress_policing(hypervisor_ip, iface)
+
+        if delta <= 0 and self._try_install_tc_ingress_drop(
+                hypervisor_ip, iface):
+            time.sleep(1)
+            LOG.warning(
+                'Veth rx_dropped induce: tc ingress drop on %s, flood from %s',
+                iface, peer)
+            delta = self._induce_rx_dropped_on_iface(
+                hypervisor_ip, iface, peer, peer_ip, iface_ip, flood_count,
+                baseline, 'Veth RX tc ingress drop', vm_ctx=vm_ctx)
+            self._remove_tc_ingress(hypervisor_ip, iface)
 
         if delta <= 0:
             LOG.warning(
@@ -580,7 +657,7 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             time.sleep(1)
             delta = self._induce_rx_dropped_on_iface(
                 hypervisor_ip, iface, peer, peer_ip, iface_ip, flood_count,
-                baseline, 'Veth RX OVS admin down')
+                baseline, 'Veth RX OVS admin down', vm_ctx=vm_ctx)
             self._set_ovs_admin_db_only(hypervisor_ip, iface, 'up')
 
         if delta <= 0:
@@ -590,17 +667,20 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             time.sleep(1)
             delta = self._induce_rx_dropped_on_iface(
                 hypervisor_ip, iface, peer, peer_ip, iface_ip, flood_count,
-                baseline, 'Veth RX kernel down')
+                baseline, 'Veth RX kernel down', vm_ctx=vm_ctx)
             self._set_kernel_link_state(hypervisor_ip, iface, 'up')
 
         self._ensure_veth_port_up(hypervisor_ip, iface)
         if delta <= 0:
             LOG.warning(
-                'rx_dropped induce finished with delta=0 on %s (baseline=%s)',
-                iface, baseline)
+                'rx_dropped induce finished with delta=0 on %s '
+                '(baseline=%s kernel_rx_dropped=%s)',
+                iface, baseline,
+                self._kernel_iface_stat(hypervisor_ip, iface, 'rx_dropped'))
 
     def _induce_tx_errors_on_iface(self, hypervisor_ip, iface, peer_ip,
-                                   iface_ip, flood_count, baseline, label):
+                                   iface_ip, flood_count, baseline, label,
+                                   vm_ctx=None):
         """Transmit from the OVS leg toward the host peer address."""
         self._hypervisor_ping_flood(
             hypervisor_ip, iface, peer_ip, flood_count)
@@ -609,21 +689,64 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
         after = self._ovs_interface_stats(hypervisor_ip, iface)
         return self._log_error_induce_stats(label, baseline, after, 'tx_errors')
 
+    def _induce_tx_errors_via_vm_broadcast(self, hypervisor_ip, iface, vm_ctx,
+                                           flood_count, baseline):
+        """Bridge flood from a VM while the test port is admin-down."""
+        bind_ip = vm_ctx['bind_ip']
+        self._set_ovs_admin_db_only(hypervisor_ip, iface, 'down')
+        time.sleep(1)
+        LOG.warning(
+            'Veth tx_errors induce: OVS admin down on %s, VM broadcast from %s',
+            iface, bind_ip)
+        self._flood_udp_dataplane(
+            vm_ctx['ssh_sender'], bind_ip, '255.255.255.255', flood_count,
+            broadcast=True)
+        after = self._ovs_interface_stats(hypervisor_ip, iface)
+        delta = self._log_error_induce_stats(
+            'Veth TX VM broadcast admin down', baseline, after, 'tx_errors')
+        self._set_ovs_admin_db_only(hypervisor_ip, iface, 'up')
+        return delta
+
     def _induce_veth_tx_errors(self, hypervisor_ip, iface, peer, iface_ip,
-                               peer_ip, flood_count):
+                               peer_ip, flood_count, vm_ctx=None):
         """Force TX failures on the OVS leg (peer address is on the host peer)."""
         self._ensure_veth_port_up(hypervisor_ip, iface)
         baseline = self._ovs_interface_stats(hypervisor_ip, iface)
 
-        self._set_ovs_admin_db_only(hypervisor_ip, iface, 'down')
-        time.sleep(1)
-        LOG.warning(
-            'Veth tx_errors induce: OVS admin down on %s, transmit to %s',
-            iface, peer_ip)
-        delta = self._induce_tx_errors_on_iface(
-            hypervisor_ip, iface, peer_ip, iface_ip, flood_count, baseline,
-            'Veth TX OVS admin down')
-        self._set_ovs_admin_db_only(hypervisor_ip, iface, 'up')
+        delta = 0
+        if vm_ctx:
+            delta = self._induce_tx_errors_via_vm_broadcast(
+                hypervisor_ip, iface, vm_ctx, flood_count, baseline)
+
+        if delta <= 0:
+            self._set_ovs_admin_db_only(hypervisor_ip, iface, 'down')
+            time.sleep(1)
+            LOG.warning(
+                'Veth tx_errors induce: OVS admin down on %s, transmit to %s',
+                iface, peer_ip)
+            delta = self._induce_tx_errors_on_iface(
+                hypervisor_ip, iface, peer_ip, iface_ip, flood_count, baseline,
+                'Veth TX OVS admin down')
+            self._set_ovs_admin_db_only(hypervisor_ip, iface, 'up')
+
+        if delta <= 0 and vm_ctx:
+            LOG.warning(
+                'Retrying tx_errors via VM broadcast with OVS link down on %s',
+                iface)
+            self._ensure_veth_port_up(hypervisor_ip, iface)
+            self._ssh_run_on_hypervisor(
+                hypervisor_ip,
+                'sudo ovs-vsctl set Interface %s link_state=down' % iface)
+            time.sleep(1)
+            self._flood_udp_dataplane(
+                vm_ctx['ssh_sender'], vm_ctx['bind_ip'], '255.255.255.255',
+                flood_count, broadcast=True)
+            after = self._ovs_interface_stats(hypervisor_ip, iface)
+            delta = self._log_error_induce_stats(
+                'Veth TX VM broadcast link down', baseline, after, 'tx_errors')
+            self._ssh_run_on_hypervisor(
+                hypervisor_ip,
+                'sudo ovs-vsctl set Interface %s link_state=up' % iface)
 
         if delta <= 0:
             LOG.warning(
@@ -671,8 +794,15 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
         self._ensure_veth_port_up(hypervisor_ip, iface)
         if delta <= 0:
             LOG.warning(
-                'tx_errors induce finished with delta=0 on %s (baseline=%s)',
-                iface, baseline)
+                'tx_errors induce finished with delta=0 on %s '
+                '(baseline=%s kernel_tx_errors=%s kernel_tx_dropped=%s '
+                'ovs_tx_failure_drops=%s)',
+                iface, baseline,
+                self._kernel_iface_stat(hypervisor_ip, iface, 'tx_errors'),
+                self._kernel_iface_stat(hypervisor_ip, iface, 'tx_dropped'),
+                self._ovs_interface_stat_int(
+                    self._ovs_interface_stats(hypervisor_ip, iface),
+                    'ovs_tx_failure_drops'))
 
     def _attach_error_test_veth(self, hypervisor_ip, preferred_bridge, iface):
         """Attach disposable veth to the VM bridge or a fallback kernel bridge."""
@@ -689,7 +819,8 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
                     iface, preferred_bridge, hypervisor_ip, exc)
         return self._create_test_interface(hypervisor_ip, iface)
 
-    def _run_veth_error_induces(self, hypervisor_ip, bridge, flood_count):
+    def _run_veth_error_induces(self, hypervisor_ip, bridge, flood_count,
+                                vm_ctx=None):
         """Induce rx_dropped/tx_errors on a disposable kernel veth port."""
         iface = ERROR_VETH_IFACE
         self._assert_valid_ifnames(iface)
@@ -723,13 +854,15 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
         baseline_rx_prom = self._prom_error_value(
             hypervisor_ip, iface, 'rx_dropped')
         self._induce_veth_rx_dropped(
-            hypervisor_ip, iface, peer, peer_ip, iface_ip, flood_count)
+            hypervisor_ip, iface, peer, peer_ip, iface_ip, flood_count,
+            vm_ctx=vm_ctx)
 
         baseline_tx = self._ovs_interface_stats(hypervisor_ip, iface)
         baseline_tx_prom = self._prom_error_value(
             hypervisor_ip, iface, 'tx_errors')
         self._induce_veth_tx_errors(
-            hypervisor_ip, iface, peer, iface_ip, peer_ip, flood_count)
+            hypervisor_ip, iface, peer, iface_ip, peer_ip, flood_count,
+            vm_ctx=vm_ctx)
 
         after = self._ovs_interface_stats(hypervisor_ip, iface)
         self._log_error_induce_stats(
@@ -877,7 +1010,7 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             ERROR_VETH_IFACE, bridge, hypervisor_ip)
         (veth_ctx, baseline_rx, baseline_tx,
          baseline_rx_prom, baseline_tx_prom) = self._run_veth_error_induces(
-            hypervisor_ip, bridge, flood_count)
+            hypervisor_ip, bridge, flood_count, vm_ctx=ctx)
 
         deltas = self._wait_for_induced_errors(
             veth_ctx, baseline_rx, baseline_tx,
