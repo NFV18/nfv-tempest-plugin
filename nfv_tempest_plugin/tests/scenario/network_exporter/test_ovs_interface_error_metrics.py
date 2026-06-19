@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import base64
 import time
 import unittest
 
@@ -225,6 +226,75 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
         self.addCleanup(restore)
         return iface
 
+    def _is_vhostuser_interface(self, hypervisor_ip, interface):
+        if interface.startswith('vhu'):
+            return True
+        itype = self._ovs_field(hypervisor_ip, interface, 'type') or ''
+        itype = itype.lower()
+        return 'vhost' in itype or 'dpdkvhost' in itype
+
+    def _set_ovs_oper_state(self, hypervisor_ip, interface, admin, link):
+        """Set OVS admin/link via OVSDB (required for vhost-user VM ports)."""
+        self._ssh_run_on_hypervisor(
+            hypervisor_ip,
+            'sudo ovs-vsctl set Interface %s admin_state=%s link_state=%s' % (
+                interface, admin, link))
+
+    def _restore_ovs_interface(self, hypervisor_ip, interface):
+        if self._is_vhostuser_interface(hypervisor_ip, interface):
+            self._set_ovs_oper_state(
+                hypervisor_ip, interface, 'up', 'up')
+            return
+        self._set_ovs_admin_only(hypervisor_ip, interface, 'up')
+        self._set_interface_link_state(hypervisor_ip, interface, 'up')
+
+    def _start_guest_udp_blackhole(self, ssh_client, port=9999):
+        """Bind UDP on the guest but never recv, to fill the vhost RX virtqueue."""
+        script = (
+            'import socket, time\n'
+            's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+            's.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)\n'
+            's.bind(("0.0.0.0", %d))\n'
+            'while True:\n'
+            '    time.sleep(3600)\n' % port)
+        encoded = base64.b64encode(script.encode('utf-8')).decode('ascii')
+        cmd = (
+            "nohup sh -c 'echo %s | base64 -d | python3' "
+            ">/tmp/ovs_error_udp_blackhole.log 2>&1 & echo $!" % encoded)
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if sudo:
+            cmd = '%s %s' % (sudo, cmd)
+        pid = ssh_client.exec_command(cmd).strip()
+        time.sleep(1)
+        self.addCleanup(self._stop_guest_udp_blackhole, ssh_client, pid)
+        return pid
+
+    def _stop_guest_udp_blackhole(self, ssh_client, pid):
+        try:
+            ssh_client.exec_command('kill %s 2>/dev/null || true' % pid)
+        except Exception as exc:
+            LOG.warning(
+                'Failed to stop guest UDP blackhole pid %s: %s', pid, exc)
+
+    def _log_error_induce_stats(self, label, baseline, current, stat_key):
+        delta = self._error_counter_delta(current, baseline, stat_key)
+        rx_pkts = (
+            self._ovs_interface_stat_int(current, 'rx_packets') -
+            self._ovs_interface_stat_int(baseline, 'rx_packets'))
+        tx_pkts = (
+            self._ovs_interface_stat_int(current, 'tx_packets') -
+            self._ovs_interface_stat_int(baseline, 'tx_packets'))
+        LOG.warning(
+            '%s: %s_delta=%s rx_packets_delta=%s tx_packets_delta=%s '
+            'rx_dropped=%s rx_missed_errors=%s tx_errors=%s '
+            'ovs_tx_failure_drops=%s',
+            label, stat_key, delta, rx_pkts, tx_pkts,
+            self._ovs_interface_stat_int(current, 'rx_dropped'),
+            self._ovs_interface_stat_int(current, 'rx_missed_errors'),
+            self._ovs_interface_stat_int(current, 'tx_errors'),
+            self._ovs_interface_stat_int(current, 'ovs_tx_failure_drops'))
+        return delta
+
     def _resolve_ovs_interface(self, server):
         if server.get('other_port'):
             return server['other_port']
@@ -303,6 +373,7 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
         script = (
             'import socket\n'
             's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+            's.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)\n'
             's.bind((%r, 0))\n'
             'payload = b"x" * 1400\n'
             'dest = (%r, 9999)\n'
@@ -359,46 +430,92 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             self._ovs_interface_error_exporter_value(baseline_stats, stat_key))
 
     def _induce_rx_dropped(self, ctx, flood_count):
-        """Shrink receiver RX ring and flood peer to overflow vhost RX queue."""
+        """Fill receiver vhost RX virtqueue, then block OVS RX if needed."""
         receiver_hyp = ctx['receiver']['hypervisor_ip']
-        baseline = self._ovs_interface_stats(
-            receiver_hyp, ctx['receiver_iface'])
+        receiver_iface = ctx['receiver_iface']
+        baseline = self._ovs_interface_stats(receiver_hyp, receiver_iface)
+
+        self._start_guest_udp_blackhole(ctx['ssh_receiver'])
         self._maybe_shrink_guest_rx_ring(
             ctx['ssh_receiver'], ctx['receiver_mac'])
         LOG.warning(
-            'Inducing rx_dropped: %d UDP datagrams %s -> %s (receiver %s:%s)',
+            'Inducing rx_dropped: blackhole + %d UDP datagrams %s -> %s '
+            '(receiver %s:%s)',
             flood_count, ctx['bind_ip'], ctx['peer_ip'],
-            receiver_hyp, ctx['receiver_iface'])
+            receiver_hyp, receiver_iface)
         self._flood_udp_dataplane(
             ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], flood_count)
+        after = self._ovs_interface_stats(receiver_hyp, receiver_iface)
+        delta = self._log_error_induce_stats(
+            'RX induce blackhole', baseline, after, 'rx_dropped')
+
+        if delta <= 0:
+            LOG.warning(
+                'Retrying rx_dropped induce: receiver OVS link down on %s:%s',
+                receiver_hyp, receiver_iface)
+            self._set_ovs_oper_state(
+                receiver_hyp, receiver_iface, 'up', 'down')
+            self.addCleanup(
+                self._restore_ovs_interface, receiver_hyp, receiver_iface)
+            time.sleep(1)
+            self._flood_udp_dataplane(
+                ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], flood_count)
+            after = self._ovs_interface_stats(receiver_hyp, receiver_iface)
+            self._log_error_induce_stats(
+                'RX induce receiver link down', baseline, after, 'rx_dropped')
+            self._restore_ovs_interface(receiver_hyp, receiver_iface)
         return baseline
 
     def _induce_tx_errors(self, ctx, flood_count):
-        """Disable sender OVS link and flood TX to increment failure drops."""
+        """Block sender vhost-user oper state while guest keeps transmitting."""
         sender_hyp = ctx['sender']['hypervisor_ip']
         sender_iface = ctx['sender_iface']
         baseline = self._ovs_interface_stats(sender_hyp, sender_iface)
+        vhost = self._is_vhostuser_interface(sender_hyp, sender_iface)
 
-        def restore_sender_iface():
-            self._set_interface_link_state(sender_hyp, sender_iface, 'up')
-            self._set_ovs_admin_only(sender_hyp, sender_iface, 'up')
-
-        self.addCleanup(restore_sender_iface)
+        self.addCleanup(self._restore_ovs_interface, sender_hyp, sender_iface)
         self._maybe_shrink_guest_tx_ring(
             ctx['ssh_sender'], ctx['sender_mac'])
+
+        if vhost:
+            self._set_ovs_oper_state(
+                sender_hyp, sender_iface, 'up', 'down')
+        else:
+            self._set_interface_link_state(sender_hyp, sender_iface, 'down')
+        time.sleep(1)
         LOG.warning(
-            'Inducing tx_errors: admin/link down on %s:%s during %d UDP '
-            'datagrams %s -> %s',
-            sender_hyp, sender_iface, flood_count,
-            ctx['bind_ip'], ctx['peer_ip'])
-        self._set_ovs_admin_only(sender_hyp, sender_iface, 'down')
-        self._set_interface_link_state(sender_hyp, sender_iface, 'down')
+            'Inducing tx_errors: sender blocked during %d UDP datagrams '
+            '%s -> %s (%s:%s vhost=%s)',
+            flood_count, ctx['bind_ip'], ctx['peer_ip'],
+            sender_hyp, sender_iface, vhost)
         try:
             self._flood_udp_dataplane(
                 ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], flood_count)
         except Exception as exc:
-            LOG.warning('UDP flood while iface down finished: %s', exc)
-        restore_sender_iface()
+            LOG.warning('UDP flood while sender blocked finished: %s', exc)
+        after = self._ovs_interface_stats(sender_hyp, sender_iface)
+        delta = self._log_error_induce_stats(
+            'TX induce link down', baseline, after, 'tx_errors')
+
+        if delta <= 0 and vhost:
+            LOG.warning(
+                'Retrying tx_errors induce: sender admin+link down on %s:%s',
+                sender_hyp, sender_iface)
+            self._set_ovs_oper_state(
+                sender_hyp, sender_iface, 'down', 'down')
+            time.sleep(1)
+            try:
+                self._flood_udp_dataplane(
+                    ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'],
+                    flood_count)
+            except Exception as exc:
+                LOG.warning(
+                    'UDP flood while sender admin down finished: %s', exc)
+            after = self._ovs_interface_stats(sender_hyp, sender_iface)
+            self._log_error_induce_stats(
+                'TX induce admin down', baseline, after, 'tx_errors')
+
+        self._restore_ovs_interface(sender_hyp, sender_iface)
         return baseline
 
     def _wait_for_induced_errors(self, ctx, baseline_rx, baseline_tx):
