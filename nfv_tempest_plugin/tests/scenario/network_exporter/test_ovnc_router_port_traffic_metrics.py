@@ -102,6 +102,29 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         return (self._min_expected_packets() *
                 CONF.nfv_plugin_options.network_exporter_traffic_min_bytes_per_packet)
 
+    def _slow_ping_cap(self):
+        return min(
+            self._traffic_ping_count(),
+            int(metrics_base.PING_MAX_WALL_SECONDS /
+                metrics_base.PING_SLOW_INTERVAL_SEC))
+
+    def _effective_traffic_expectations(self, ssh_sender):
+        """Return (min_packets, min_bytes) achievable on this guest."""
+        min_packets = self._min_expected_packets()
+        min_bytes = self._min_expected_bytes()
+        if self._guest_has_passwordless_sudo(ssh_sender):
+            return min_packets, min_bytes
+        capped = self._slow_ping_cap()
+        if capped >= min_packets:
+            return min_packets, min_bytes
+        LOG.warning(
+            'No passwordless sudo on sender; expecting >= %d router pkts/bytes '
+            '(slow ping cap %d, configured min pkts %d)',
+            capped, capped, min_packets)
+        return capped, (
+            capped *
+            CONF.nfv_plugin_options.network_exporter_traffic_min_bytes_per_packet)
+
     def _populate_provider_networks(self, servers):
         for server in servers:
             server['provider_networks'] = server.get('trunk_networks', [])
@@ -176,9 +199,12 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         return key, deltas[key]
 
     def _wait_for_router_traffic_counters(self, hypervisor_ip, baseline_pkts,
-                                          baseline_bytes):
-        min_packets = self._min_expected_packets()
-        min_bytes = self._min_expected_bytes()
+                                          baseline_bytes, min_packets=None,
+                                          min_bytes=None):
+        min_packets = (min_packets if min_packets is not None else
+                       self._min_expected_packets())
+        min_bytes = (min_bytes if min_bytes is not None else
+                     self._min_expected_bytes())
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
@@ -259,12 +285,15 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
         ssh_sender = self.get_remote_client(
             sender['fip'], self.instance_user, key_pair['private_key'])
+        min_packets, min_bytes = self._effective_traffic_expectations(
+            ssh_sender)
         self._send_ping_packets_bound(
             ssh_sender, bind_ip, peer_ip, self._traffic_ping_count(),
-            self._min_expected_packets())
+            min_packets)
 
         result = self._wait_for_router_traffic_counters(
-            hypervisor_ip, baseline_pkts, baseline_bytes)
+            hypervisor_ip, baseline_pkts, baseline_bytes,
+            min_packets=min_packets, min_bytes=min_bytes)
         LOG.warning(
             'Router port traffic OK: pkts series %s +%s, bytes series %s +%s',
             result['pkts_key'], result['pkts_delta'],
