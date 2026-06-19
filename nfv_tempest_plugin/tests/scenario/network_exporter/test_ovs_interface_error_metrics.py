@@ -496,12 +496,50 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             hypervisor_ip,
             'sudo tc qdisc del dev %s ingress 2>/dev/null || true' % iface)
 
-    def _install_tc_egress_corrupt(self, hypervisor_ip, iface):
-        """Corrupt all egress on the OVS netdev (may increment tx_errors)."""
-        self._ssh_run_on_hypervisor(
+    def _try_install_tc_netem(self, hypervisor_ip, iface, netem_opts):
+        """Install a netem root qdisc; return False if sch_netem is unavailable."""
+        self._ssh_run_unchecked_on_hypervisor(
             hypervisor_ip,
-            'sudo tc qdisc replace dev %s root netem corrupt 100%%' % iface)
+            'sudo modprobe sch_netem 2>/dev/null || true')
+        out = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'sudo tc qdisc replace dev %s root netem %s 2>&1; echo __rc__:$?' % (
+                iface, netem_opts))
+        if '__rc__:0' not in out or (
+                out and ('unknown' in out.lower() or 'error:' in out.lower())):
+            LOG.warning(
+                'tc netem unavailable on %s for %s: %s',
+                hypervisor_ip, iface, out.strip())
+            return False
         self.addCleanup(self._remove_tc_root, hypervisor_ip, iface)
+        return True
+
+    def _restore_iface_mtu(self, hypervisor_ip, iface, mtu):
+        self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'sudo ip link set dev %s mtu %d 2>/dev/null || true' % (
+                iface, mtu))
+
+    def _induce_tx_errors_via_small_mtu(self, hypervisor_ip, iface, peer_ip,
+                                        iface_ip, flood_count, baseline):
+        """Oversize frames on a tiny MTU may increment netdev tx_errors."""
+        mtu_out = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip,
+            'cat /sys/class/net/%s/mtu 2>/dev/null' % iface).strip()
+        try:
+            old_mtu = int(mtu_out)
+        except (TypeError, ValueError):
+            old_mtu = 1500
+        self._ssh_run_on_hypervisor(
+            hypervisor_ip, 'sudo ip link set dev %s mtu 256' % iface)
+        self.addCleanup(self._restore_iface_mtu, hypervisor_ip, iface, old_mtu)
+        time.sleep(1)
+        LOG.warning(
+            'Veth tx_errors induce: mtu 256 on %s, transmit to %s',
+            iface, peer_ip)
+        return self._induce_tx_errors_on_iface(
+            hypervisor_ip, iface, peer_ip, iface_ip, flood_count, baseline,
+            'Veth TX small MTU')
 
     def _remove_tc_root(self, hypervisor_ip, iface):
         self._ssh_run_unchecked_on_hypervisor(
@@ -618,12 +656,17 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             LOG.warning(
                 'Retrying tx_errors via tc netem corrupt on %s', iface)
             self._ensure_veth_port_up(hypervisor_ip, iface)
-            self._install_tc_egress_corrupt(hypervisor_ip, iface)
-            time.sleep(1)
-            delta = self._induce_tx_errors_on_iface(
-                hypervisor_ip, iface, peer_ip, iface_ip, flood_count, baseline,
-                'Veth TX tc corrupt')
-            self._remove_tc_root(hypervisor_ip, iface)
+            if self._try_install_tc_netem(
+                    hypervisor_ip, iface, 'corrupt 100%'):
+                time.sleep(1)
+                delta = self._induce_tx_errors_on_iface(
+                    hypervisor_ip, iface, peer_ip, iface_ip, flood_count,
+                    baseline, 'Veth TX tc corrupt')
+                self._remove_tc_root(hypervisor_ip, iface)
+
+        if delta <= 0:
+            delta = self._induce_tx_errors_via_small_mtu(
+                hypervisor_ip, iface, peer_ip, iface_ip, flood_count, baseline)
 
         self._ensure_veth_port_up(hypervisor_ip, iface)
         if delta <= 0:
