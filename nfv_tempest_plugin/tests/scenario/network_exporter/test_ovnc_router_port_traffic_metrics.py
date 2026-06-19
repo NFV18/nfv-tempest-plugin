@@ -102,29 +102,6 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         return (self._min_expected_packets() *
                 CONF.nfv_plugin_options.network_exporter_traffic_min_bytes_per_packet)
 
-    def _slow_ping_cap(self):
-        return min(
-            self._traffic_ping_count(),
-            int(metrics_base.PING_MAX_WALL_SECONDS /
-                metrics_base.PING_SLOW_INTERVAL_SEC))
-
-    def _effective_traffic_expectations(self, ssh_sender):
-        """Return (min_packets, min_bytes) achievable on this guest."""
-        min_packets = self._min_expected_packets()
-        min_bytes = self._min_expected_bytes()
-        if self._guest_has_passwordless_sudo(ssh_sender):
-            return min_packets, min_bytes
-        capped = self._slow_ping_cap()
-        if capped >= min_packets:
-            return min_packets, min_bytes
-        LOG.warning(
-            'No passwordless sudo on sender; expecting >= %d router pkts/bytes '
-            '(slow ping cap %d, configured min pkts %d)',
-            capped, capped, min_packets)
-        return capped, (
-            capped *
-            CONF.nfv_plugin_options.network_exporter_traffic_min_bytes_per_packet)
-
     def _populate_provider_networks(self, servers):
         for server in servers:
             server['provider_networks'] = server.get('trunk_networks', [])
@@ -148,43 +125,78 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
             return None
         return self.test_network_dict.get(mgmt_name, {}).get('net-id')
 
-    def _cross_subnet_peer_ips(self, sender, receiver):
-        """Return (sender_bind_ip, receiver_ip) on different subnets."""
+    @staticmethod
+    def _same_ipv4_subnet(ip_a, ip_b):
+        return ip_a.split('.')[:3] == ip_b.split('.')[:3]
+
+    def _cross_subnet_peer_candidates(self, sender, receiver):
+        """Return ordered (bind_ip, peer_ip) pairs that traverse the router.
+
+        Prefer mgmt -> dataplane: binding to an external IP and pinging a
+        directly-connected mgmt address often fails because Linux selects the
+        mgmt interface for the destination subnet.
+        """
         mgmt_net_id = self._mgmt_network_id()
-        recv_ip = None
-        for r_net in receiver['provider_networks']:
-            if mgmt_net_id and r_net['network_id'] == mgmt_net_id:
-                recv_ip = r_net['ip_address']
-                break
-        if not recv_ip:
-            recv_ip = receiver['provider_networks'][0]['ip_address']
-        recv_net_id = None
-        for r_net in receiver['provider_networks']:
-            if r_net['ip_address'] == recv_ip:
-                recv_net_id = r_net['network_id']
-                break
-        send_bind_ip = None
+        scored = []
+        seen = set()
         for s_net in sender['provider_networks']:
-            if recv_net_id and s_net['network_id'] != recv_net_id:
-                send_bind_ip = s_net['ip_address']
-                break
-        if not send_bind_ip:
-            for s_net in sender['provider_networks']:
-                if mgmt_net_id and s_net['network_id'] != mgmt_net_id:
-                    send_bind_ip = s_net['ip_address']
-                    break
-        if not send_bind_ip or not recv_ip:
+            for r_net in receiver['provider_networks']:
+                if s_net['network_id'] == r_net['network_id']:
+                    continue
+                bind_ip = s_net['ip_address']
+                peer_ip = r_net['ip_address']
+                if self._same_ipv4_subnet(bind_ip, peer_ip):
+                    continue
+                key = (bind_ip, peer_ip)
+                if key in seen:
+                    continue
+                seen.add(key)
+                s_mgmt = mgmt_net_id and s_net['network_id'] == mgmt_net_id
+                r_mgmt = mgmt_net_id and r_net['network_id'] == mgmt_net_id
+                if s_mgmt and not r_mgmt:
+                    score = 0
+                elif not s_mgmt and not r_mgmt:
+                    score = 1
+                elif s_mgmt and r_mgmt:
+                    score = 2
+                else:
+                    score = 3
+                scored.append((score, bind_ip, peer_ip))
+        scored.sort(key=lambda item: item[0])
+        return [(bind_ip, peer_ip) for _, bind_ip, peer_ip in scored]
+
+    def _select_cross_subnet_pair(self, ssh_sender, sender, receiver):
+        """Pick a routable cross-subnet IP pair, probing with bound ICMP."""
+        candidates = self._cross_subnet_peer_candidates(sender, receiver)
+        if not candidates:
             self.fail(
                 'Could not find cross-subnet IPs between VMs %s and %s. '
                 'Ensure mgmt and at least one other routed network.' % (
                     sender.get('name', sender['id']),
                     receiver.get('name', receiver['id'])))
-        if send_bind_ip.split('.')[:3] == recv_ip.split('.')[:3]:
-            self.fail(
-                'Sender bind %s and receiver %s appear to share a subnet; '
-                'router traffic test requires different subnets.' % (
-                    send_bind_ip, recv_ip))
-        return send_bind_ip, recv_ip
+        for bind_ip, peer_ip in candidates:
+            LOG.warning(
+                'Probing cross-subnet pair bind %s -> %s', bind_ip, peer_ip)
+            if self._probe_bound_ping(ssh_sender, bind_ip, peer_ip):
+                LOG.warning(
+                    'Using routable cross-subnet pair bind %s -> %s',
+                    bind_ip, peer_ip)
+                return bind_ip, peer_ip
+        bind_ip, peer_ip = candidates[0]
+        LOG.warning(
+            'No bound ICMP probe succeeded; using best candidate bind %s -> %s '
+            'with UDP flood only',
+            bind_ip, peer_ip)
+        return bind_ip, peer_ip
+
+    def _send_router_cross_subnet_traffic(self, ssh_sender, bind_ip, peer_ip,
+                                          packet_count):
+        """Generate L3 traffic through the Neutron router via bound UDP."""
+        LOG.warning(
+            'Sending %d bound UDP datagrams from %s to %s',
+            packet_count, bind_ip, peer_ip)
+        self._flood_udp_dataplane(
+            ssh_sender, bind_ip, peer_ip, packet_count)
 
     def _sample_map_deltas(self, after, before):
         deltas = {}
@@ -261,7 +273,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
     # --- Traffic ---
 
     def test_ovnc_router_port_traffic_increments_with_cross_subnet_traffic(self):
-        """Boot two VMs on routed subnets, ping across router, verify counters."""
+        """Boot two VMs on routed subnets, send L3 traffic, verify counters."""
         servers, key_pair = self._boot_router_traffic_vms()
         self.assertEqual(2, len(servers), 'Test requires exactly two VMs')
         if not servers[0].get('provider_networks'):
@@ -271,29 +283,27 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                 self._populate_provider_networks(servers)
 
         sender, receiver = servers[0], servers[1]
-        bind_ip, peer_ip = self._cross_subnet_peer_ips(sender, receiver)
         hypervisor_ip = sender['hypervisor_ip']
+        ssh_sender = self.get_remote_client(
+            sender['fip'], self.instance_user, key_pair['private_key'])
+        bind_ip, peer_ip = self._select_cross_subnet_pair(
+            ssh_sender, sender, receiver)
+        packet_count = self._traffic_ping_count()
         LOG.warning(
-            'Router traffic test: %s ping -I %s -> %s (hypervisor %s), count %s',
+            'Router traffic test: %s bind %s -> %s (hypervisor %s), count %s',
             sender.get('name', sender['id']), bind_ip, peer_ip, hypervisor_ip,
-            self._traffic_ping_count())
+            packet_count)
 
         baseline_pkts = self._router_port_sample_map(
             hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
         baseline_bytes = self._router_port_sample_map(
             hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
-        ssh_sender = self.get_remote_client(
-            sender['fip'], self.instance_user, key_pair['private_key'])
-        min_packets, min_bytes = self._effective_traffic_expectations(
-            ssh_sender)
-        self._send_ping_packets_bound(
-            ssh_sender, bind_ip, peer_ip, self._traffic_ping_count(),
-            min_packets)
+        self._send_router_cross_subnet_traffic(
+            ssh_sender, bind_ip, peer_ip, packet_count)
 
         result = self._wait_for_router_traffic_counters(
-            hypervisor_ip, baseline_pkts, baseline_bytes,
-            min_packets=min_packets, min_bytes=min_bytes)
+            hypervisor_ip, baseline_pkts, baseline_bytes)
         LOG.warning(
             'Router port traffic OK: pkts series %s +%s, bytes series %s +%s',
             result['pkts_key'], result['pkts_delta'],

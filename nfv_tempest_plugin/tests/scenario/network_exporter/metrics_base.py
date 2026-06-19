@@ -484,15 +484,15 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 if '100% packet loss' not in (output or ''):
                     return output
                 errors.append('%s -> 100%% packet loss' % cmd)
-        wall = min(PING_MAX_WALL_SECONDS,
-                   max(30, int(count * PING_SLOW_INTERVAL_SEC) + 15))
-        capped = min(count, int(wall / PING_SLOW_INTERVAL_SEC))
+        capped = min(count, int(PING_MAX_WALL_SECONDS /
+                                 PING_SLOW_INTERVAL_SEC))
         if capped < min_packets:
             LOG.warning(
                 'Bound ping capped at %d without passwordless sudo '
                 '(requested min %d); using capped count at %gs interval',
                 capped, min_packets, PING_SLOW_INTERVAL_SEC)
             min_packets = capped
+        wall = int(capped * PING_SLOW_INTERVAL_SEC) + 30
         cmd = 'timeout %d ping -c %d -I %s -i %g -W 2 %s' % (
             wall, capped, bind_ip, PING_SLOW_INTERVAL_SEC, dest_ip)
         LOG.warning('Sending bound ping (slow path): %s', cmd)
@@ -506,6 +506,44 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             errors.append('%s -> 100%% packet loss' % cmd)
         detail = '; '.join(errors) if errors else 'bound ping failed'
         self.fail('Ping from %s to %s failed: %s' % (bind_ip, dest_ip, detail))
+
+    def _probe_bound_ping(self, ssh_client, bind_ip, dest_ip, count=5):
+        """Return True when at least one ICMP reply is received on bind_ip."""
+        sudo = self._guest_sudo_prefix(ssh_client)
+        base = 'ping -c %d -I %s -W 2 %s 2>&1' % (count, bind_ip, dest_ip)
+        cmd = '%s %s || true' % (sudo, base) if sudo else '%s || true' % base
+        try:
+            output = ssh_client.exec_command(cmd) or ''
+        except Exception as exc:
+            LOG.warning('Bound ping probe %s -> %s failed: %s',
+                        bind_ip, dest_ip, exc)
+            return False
+        if '100% packet loss' in output:
+            return False
+        match = re.search(r'(\d+) received', output)
+        return bool(match and int(match.group(1)) > 0)
+
+    def _flood_udp_dataplane(self, ssh_client, bind_ip, dest_ip, packet_count,
+                             broadcast=False):
+        """Send UDP datagrams bound to bind_ip (no sudo required)."""
+        bcast = 'True' if broadcast else 'False'
+        script = (
+            'import socket\n'
+            's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
+            's.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)\n'
+            'if %s:\n'
+            '    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)\n'
+            's.bind((%r, 0))\n'
+            'payload = b"x" * 1400\n'
+            'dest = (%r, 9999)\n'
+            'for _ in range(%d):\n'
+            '    try:\n'
+            '        s.sendto(payload, dest)\n'
+            '    except OSError:\n'
+            '        pass\n'
+            % (bcast, bind_ip, dest_ip, packet_count))
+        timeout_sec = max(180, int(packet_count / 500) + 60)
+        self._run_guest_python_script(ssh_client, script, timeout_sec=timeout_sec)
 
     def _assert_ovs_interface_metric_reported(self, metric_name):
         """Assert metric on openstack metric show, compute :9105, metric-storage."""
