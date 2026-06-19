@@ -110,6 +110,11 @@ NET_VF_METRIC_TO_SYSFS_STAT = {
 }
 # OVN/K8s service metrics (northd, controller, etc.), not compute :9105
 OVN_K8S_METRICS_PORT = ':1981'
+OVN_CONTROLLER_METRICS_POD_RE = r'ovn-controller-metrics.*'
+OVN_CONTROLLER_METRICS_CONTAINER = 'ovn-controller-metrics'
+OVN_CONTROLLER_METRICS_CURL = (
+    'curl -sk https://127.0.0.1:1981/metrics 2>/dev/null || '
+    'curl -s http://127.0.0.1:1981/metrics 2>/dev/null')
 PROM_METRIC_LINE_RE = re.compile(
     r'^(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
     r'\{(?P<labels>[^}]*)\}\s+'
@@ -288,6 +293,89 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         cmd_http = "curl -s http://127.0.0.1:9105/metrics 2>/dev/null"
         return self._ssh_run_on_hypervisor(hypervisor_ip, cmd_http)
 
+    def _scrape_ovn_metrics_text(self, hypervisor_ip):
+        """Return OVN controller exporter Prometheus text from a compute node."""
+        return self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip, OVN_CONTROLLER_METRICS_CURL)
+
+    def _ovn_controller_metrics_pods(self):
+        return self.k8s_client.search_pods_using_regex(
+            OVN_CONTROLLER_METRICS_POD_RE, OPENSTACK_NAMESPACE)
+
+    def _ovn_controller_metrics_pod_on_hypervisor(self, hypervisor_ip):
+        for pod in self._ovn_controller_metrics_pods():
+            node = (pod.get('spec') or {}).get('nodeName') or ''
+            if not node:
+                continue
+            node_short = node.split('.')[0]
+            for ident in self._hypervisor_identifiers(hypervisor_ip):
+                ident_short = ident.split('.')[0]
+                if (ident in node or node in ident or
+                        ident_short == node_short):
+                    return pod['metadata']['name']
+        return None
+
+    def _scrape_ovn_controller_metrics_pod(self, hypervisor_ip=None):
+        """Scrape ovn-controller-metrics :1981 via pod exec."""
+        pod_name = None
+        if hypervisor_ip:
+            pod_name = self._ovn_controller_metrics_pod_on_hypervisor(
+                hypervisor_ip)
+        if not pod_name:
+            pods = self._ovn_controller_metrics_pods()
+            if pods:
+                pod_name = pods[0]['metadata']['name']
+        if not pod_name:
+            return ''
+        try:
+            return self.k8s_client.execute_command_in_pod(
+                pod_name, OPENSTACK_NAMESPACE,
+                OVN_CONTROLLER_METRICS_CONTAINER,
+                OVN_CONTROLLER_METRICS_CURL)
+        except Exception as exc:
+            LOG.warning(
+                'ovn-controller-metrics scrape failed for pod %s: %s',
+                pod_name, exc)
+            return ''
+
+    def _ovn_metric_scrape_outputs(self, hypervisor_ip=None):
+        """Yield Prometheus text from OVN :1981 sources (node-local then pod)."""
+        if hypervisor_ip:
+            output = self._scrape_ovn_metrics_text(hypervisor_ip)
+            if output.strip():
+                yield ('compute:%s' % hypervisor_ip, output)
+        pod_output = self._scrape_ovn_controller_metrics_pod(hypervisor_ip)
+        if pod_output.strip():
+            yield ('ovn-controller-metrics', pod_output)
+
+    def _assert_metric_on_ovn_scrape(self, metric_name):
+        """Verify metric_name appears on an OVN :1981 scrape target."""
+        hypervisors = self._get_hypervisor_ip_from_undercloud()
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisor IPs available for OVN :1981 scrape')
+        found_on = []
+        for hypervisor_ip in hypervisors:
+            for source, output in self._ovn_metric_scrape_outputs(hypervisor_ip):
+                for line in output.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith(metric_name + '{') or stripped.startswith(
+                            metric_name + ' '):
+                        found_on.append('%s@%s' % (source, hypervisor_ip))
+                        break
+                if found_on:
+                    break
+            if found_on:
+                break
+        self.assertNotEmpty(
+            found_on,
+            "Metric '%s' not found on OVN :1981 scrape from hypervisors %s "
+            "(checked local :1981 and ovn-controller-metrics pods)" % (
+                metric_name, hypervisors))
+        LOG.warning(
+            "Metric '%s' found on OVN :1981 scrape from %s",
+            metric_name, found_on)
+
     def _guest_has_passwordless_sudo(self, ssh_client):
         """Return True when the guest accepts ``sudo -n`` without prompting."""
         try:
@@ -436,8 +524,9 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 metric_name, query_error))
 
     def _assert_router_port_metric_reported(self, metric_name):
-        """Assert ovnc_router_port_traffic_* on compute :9105 and metric-storage."""
-        self._assert_metric_on_compute_scrape(metric_name)
+        """Assert ovnc_router_port_traffic_* on OVN :1981 and metric-storage."""
+        self._assert_metric_reported(metric_name)
+        self._assert_metric_on_ovn_scrape(metric_name)
         storage_samples, query_error = self._metric_storage_samples(metric_name)
         self.assertNotEmpty(
             storage_samples,
@@ -448,18 +537,25 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         """Stable identity for ovnc_router_port_traffic series."""
         return (labels.get('datapath'), labels.get('port'))
 
+    def _router_port_prom_samples(self, hypervisor_ip, metric_name):
+        """Return router-port samples from OVN :1981 (not compute :9105)."""
+        for _source, output in self._ovn_metric_scrape_outputs(hypervisor_ip):
+            samples = self._parse_prom_samples(output, metric_name)
+            if samples:
+                return samples
+        return self._parse_prom_samples(
+            self._scrape_compute_metrics_text(hypervisor_ip), metric_name)
+
     def _prom_router_port_samples(self, hypervisor_ip, metric_name):
-        """Return all router-port metric samples from compute :9105."""
-        output = self._scrape_compute_metrics_text(hypervisor_ip)
-        return self._parse_prom_samples(output, metric_name)
+        """Return all router-port metric samples from OVN :1981."""
+        return self._router_port_prom_samples(hypervisor_ip, metric_name)
 
     def _router_port_sample_map(self, hypervisor_ip, metric_name, storage=False):
-        """Map (datapath, port) -> value from :9105 or metric-storage."""
+        """Map (datapath, port) -> value from OVN :1981 or metric-storage."""
         if storage:
-            samples, _ = self._metric_storage_samples(
-                metric_name, hypervisor_ip=hypervisor_ip)
+            samples, _ = self._metric_storage_samples(metric_name)
         else:
-            samples = self._prom_router_port_samples(hypervisor_ip, metric_name)
+            samples = self._router_port_prom_samples(hypervisor_ip, metric_name)
         return {
             self._router_port_label_key(sample['labels']): sample['value']
             for sample in samples

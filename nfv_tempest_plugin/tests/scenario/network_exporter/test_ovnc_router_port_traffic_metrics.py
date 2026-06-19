@@ -181,7 +181,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
             hypervisor_ip, metric_name, storage=True)
         self.assertIn(
             label_key, prom_map,
-            '%s series %s missing on :9105 for %s' % (
+            '%s series %s missing on OVN :1981 scrape for %s' % (
                 metric_name, label_key, hypervisor_ip))
         self.assertIn(
             label_key, storage_map,
@@ -189,7 +189,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                 metric_name, label_key, hypervisor_ip))
         self.assertEqual(
             prom_map[label_key], storage_map[label_key],
-            '%s :9105=%s metric-storage=%s for %s series %s' % (
+            '%s OVN :1981=%s metric-storage=%s for %s series %s' % (
                 metric_name, prom_map[label_key], storage_map[label_key],
                 hypervisor_ip, label_key))
 
@@ -249,12 +249,12 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
     # --- Presence ---
 
     def test_ovnc_router_port_traffic_pkts_reported(self):
-        """Verify ovnc_router_port_traffic_pkts on :9105 and metric-storage."""
+        """Verify ovnc_router_port_traffic_pkts on OVN :1981 and metric-storage."""
         self._assert_router_port_metric_reported(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
 
     def test_ovnc_router_port_traffic_bytes_reported(self):
-        """Verify ovnc_router_port_traffic_bytes on :9105 and metric-storage."""
+        """Verify ovnc_router_port_traffic_bytes on OVN :1981 and metric-storage."""
         self._assert_router_port_metric_reported(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
