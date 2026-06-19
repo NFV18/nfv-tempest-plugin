@@ -507,7 +507,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         detail = '; '.join(errors) if errors else 'bound ping failed'
         self.fail('Ping from %s to %s failed: %s' % (bind_ip, dest_ip, detail))
 
-    def _probe_bound_ping(self, ssh_client, bind_ip, dest_ip, count=5):
+    def _probe_bound_ping(self, ssh_client, bind_ip, dest_ip, count=3):
         """Return True when at least one ICMP reply is received on bind_ip."""
         sudo = self._guest_sudo_prefix(ssh_client)
         base = 'ping -c %d -I %s -W 2 %s 2>&1' % (count, bind_ip, dest_ip)

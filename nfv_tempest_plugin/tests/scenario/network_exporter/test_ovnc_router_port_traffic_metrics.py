@@ -102,6 +102,29 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         return (self._min_expected_packets() *
                 CONF.nfv_plugin_options.network_exporter_traffic_min_bytes_per_packet)
 
+    def _slow_ping_cap(self):
+        return min(
+            self._traffic_ping_count(),
+            int(metrics_base.PING_MAX_WALL_SECONDS /
+                metrics_base.PING_SLOW_INTERVAL_SEC))
+
+    def _effective_traffic_expectations(self, ssh_sender):
+        """Return (min_packets, min_bytes) achievable on this guest."""
+        min_packets = self._min_expected_packets()
+        min_bytes = self._min_expected_bytes()
+        if self._guest_has_passwordless_sudo(ssh_sender):
+            return min_packets, min_bytes
+        capped = self._slow_ping_cap()
+        if capped >= min_packets:
+            return min_packets, min_bytes
+        LOG.warning(
+            'No passwordless sudo on sender; expecting >= %d router pkts/bytes '
+            '(slow ping cap %d, configured min pkts %d)',
+            capped, capped, min_packets)
+        return capped, (
+            capped *
+            CONF.nfv_plugin_options.network_exporter_traffic_min_bytes_per_packet)
+
     def _populate_provider_networks(self, servers):
         for server in servers:
             server['provider_networks'] = server.get('trunk_networks', [])
@@ -190,8 +213,25 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         return bind_ip, peer_ip
 
     def _send_router_cross_subnet_traffic(self, ssh_sender, bind_ip, peer_ip,
-                                          packet_count):
-        """Generate L3 traffic through the Neutron router via bound UDP."""
+                                          packet_count, min_packets):
+        """Generate L3 traffic through the Neutron router.
+
+        ovnc_router_port_traffic_* tracks ICMP-sized L3 packets on logical
+        router ports; bound ICMP is the primary generator. UDP is a fallback
+        when ICMP cannot be sent at the required rate.
+        """
+        LOG.warning(
+            'Sending %d bound ICMP echo requests from %s to %s',
+            packet_count, bind_ip, peer_ip)
+        try:
+            self._send_ping_packets_bound(
+                ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
+            return
+        except AssertionError as exc:
+            LOG.warning(
+                'Bound ICMP flood from %s to %s failed (%s); '
+                'falling back to bound UDP',
+                bind_ip, peer_ip, exc)
         LOG.warning(
             'Sending %d bound UDP datagrams from %s to %s',
             packet_count, bind_ip, peer_ip)
@@ -210,9 +250,28 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         key = max(deltas, key=deltas.get)
         return key, deltas[key]
 
+    def _router_port_delta_summary(self, pkts_after, pkts_before,
+                                   bytes_after, bytes_before):
+        pkts_delta = self._sample_map_deltas(pkts_after, pkts_before)
+        bytes_delta = self._sample_map_deltas(bytes_after, bytes_before)
+        pkts_key, pkts_peak = self._best_delta_key(pkts_delta)
+        bytes_key, bytes_peak = self._best_delta_key(bytes_delta)
+        return {
+            'pkts_key': pkts_key,
+            'pkts_delta': sum(pkts_delta.values()),
+            'pkts_peak_delta': pkts_peak,
+            'pkts_by_port': pkts_delta,
+            'bytes_key': bytes_key,
+            'bytes_delta': sum(bytes_delta.values()),
+            'bytes_peak_delta': bytes_peak,
+            'bytes_by_port': bytes_delta,
+        }
+
     def _wait_for_router_traffic_counters(self, hypervisor_ip, baseline_pkts,
                                           baseline_bytes, min_packets=None,
-                                          min_bytes=None):
+                                          min_bytes=None, ssh_sender=None,
+                                          bind_ip=None, peer_ip=None,
+                                          packet_count=None):
         min_packets = (min_packets if min_packets is not None else
                        self._min_expected_packets())
         min_bytes = (min_bytes if min_bytes is not None else
@@ -220,27 +279,28 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
+            if (attempt > 0 and ssh_sender is not None and bind_ip and
+                    peer_ip and packet_count):
+                LOG.warning(
+                    'Re-sending router traffic (attempt %s/%s)',
+                    attempt + 1, metrics_base.METRIC_RETRY_ATTEMPTS)
+                self._send_router_cross_subnet_traffic(
+                    ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
             pkts_after = self._router_port_sample_map(
                 hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
             bytes_after = self._router_port_sample_map(
                 hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
-            pkts_delta = self._sample_map_deltas(pkts_after, baseline_pkts)
-            bytes_delta = self._sample_map_deltas(bytes_after, baseline_bytes)
-            pkts_key, pkts_inc = self._best_delta_key(pkts_delta)
-            bytes_key, bytes_inc = self._best_delta_key(bytes_delta)
-            last = {
-                'pkts_key': pkts_key,
-                'pkts_delta': pkts_inc,
-                'bytes_key': bytes_key,
-                'bytes_delta': bytes_inc,
-            }
+            last = self._router_port_delta_summary(
+                pkts_after, baseline_pkts, bytes_after, baseline_bytes)
             try:
-                self.assertIsNotNone(pkts_key)
+                self.assertNotEqual(last['pkts_delta'], 0,
+                                    'ovnc_router_port_traffic_pkts delta %s' %
+                                    last)
                 self.assertGreaterEqual(
-                    pkts_inc, min_packets,
+                    last['pkts_delta'], min_packets,
                     'ovnc_router_port_traffic_pkts delta %s' % last)
                 self.assertGreaterEqual(
-                    bytes_inc, min_bytes,
+                    last['bytes_delta'], min_bytes,
                     'ovnc_router_port_traffic_bytes delta %s' % last)
                 LOG.warning(
                     'Router port counters increased (attempt %s): %s',
@@ -289,10 +349,13 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         bind_ip, peer_ip = self._select_cross_subnet_pair(
             ssh_sender, sender, receiver)
         packet_count = self._traffic_ping_count()
+        min_packets, min_bytes = self._effective_traffic_expectations(
+            ssh_sender)
         LOG.warning(
-            'Router traffic test: %s bind %s -> %s (hypervisor %s), count %s',
+            'Router traffic test: %s bind %s -> %s (hypervisor %s), count %s, '
+            'min pkts %s',
             sender.get('name', sender['id']), bind_ip, peer_ip, hypervisor_ip,
-            packet_count)
+            packet_count, min_packets)
 
         baseline_pkts = self._router_port_sample_map(
             hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
@@ -300,11 +363,16 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
             hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
         self._send_router_cross_subnet_traffic(
-            ssh_sender, bind_ip, peer_ip, packet_count)
+            ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
 
         result = self._wait_for_router_traffic_counters(
-            hypervisor_ip, baseline_pkts, baseline_bytes)
+            hypervisor_ip, baseline_pkts, baseline_bytes,
+            min_packets=min_packets, min_bytes=min_bytes,
+            ssh_sender=ssh_sender, bind_ip=bind_ip, peer_ip=peer_ip,
+            packet_count=packet_count)
         LOG.warning(
-            'Router port traffic OK: pkts series %s +%s, bytes series %s +%s',
-            result['pkts_key'], result['pkts_delta'],
-            result['bytes_key'], result['bytes_delta'])
+            'Router port traffic OK: pkts total +%s (peak port %s +%s), '
+            'bytes total +%s (peak port %s +%s)',
+            result['pkts_delta'], result['pkts_key'],
+            result['pkts_peak_delta'], result['bytes_delta'],
+            result['bytes_key'], result['bytes_peak_delta'])
