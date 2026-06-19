@@ -758,6 +758,15 @@ class ManagerMixin(object):
 
         return statistics
 
+    def _ovs_interface_stat_int(self, stats, key):
+        """Return one OVS Interface statistics counter (missing keys mean zero)."""
+        if not stats:
+            return 0
+        value = stats.get(key, 0)
+        if value is None:
+            return 0
+        return int(value)
+
     def get_ovs_multicast_groups(self, switch, multicast_ip=None,
                                  hypervisor=None):
         """This method get ovs multicast groups

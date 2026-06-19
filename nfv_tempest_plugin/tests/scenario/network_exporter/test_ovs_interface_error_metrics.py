@@ -205,7 +205,7 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
     def _assert_error_stat_match_ovs(self, hypervisor_ip, interface,
                                      stat_key, ovs_stats):
         metric_name = metrics_base.OVS_INTERFACE_ERROR_STAT_TO_METRIC[stat_key]
-        ovs_value = int(ovs_stats[stat_key])
+        ovs_value = self._ovs_interface_stat_int(ovs_stats, stat_key)
         prom = self._prom_compute_metric_value(
             hypervisor_ip, metric_name, {'interface': interface})
         storage = self._storage_counter_value(
@@ -283,14 +283,16 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             sender_stats = self._ovs_interface_stats(
                 ctx['sender']['hypervisor_ip'], ctx['sender_iface'])
             rx_drop_delta = (
-                int(receiver_stats['rx_dropped']) -
-                int(baseline_receiver['rx_dropped']))
+                self._ovs_interface_stat_int(receiver_stats, 'rx_dropped') -
+                self._ovs_interface_stat_int(baseline_receiver, 'rx_dropped'))
             tx_err_delta = (
-                int(sender_stats['tx_errors']) -
-                int(baseline_sender['tx_errors']))
+                self._ovs_interface_stat_int(sender_stats, 'tx_errors') -
+                self._ovs_interface_stat_int(baseline_sender, 'tx_errors'))
             last = {
                 'rx_dropped_delta': rx_drop_delta,
                 'tx_errors_delta': tx_err_delta,
+                'receiver_stats_keys': sorted(receiver_stats.keys()),
+                'sender_stats_keys': sorted(sender_stats.keys()),
             }
             try:
                 self.assertGreater(
@@ -371,20 +373,22 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
         sender_hyp = ctx['sender']['hypervisor_ip']
         sender_iface = ctx['sender_iface']
 
-        def restore_admin():
+        def restore_sender_iface():
+            self._set_interface_link_state(sender_hyp, sender_iface, 'up')
             self._set_ovs_admin_only(sender_hyp, sender_iface, 'up')
 
-        self.addCleanup(restore_admin)
+        self.addCleanup(restore_sender_iface)
         LOG.warning(
-            'Inducing tx_errors: admin_state=down on %s:%s during ping',
+            'Inducing tx_errors: admin/link down on %s:%s during UDP flood',
             sender_hyp, sender_iface)
         self._set_ovs_admin_only(sender_hyp, sender_iface, 'down')
+        self._set_interface_link_state(sender_hyp, sender_iface, 'down')
         try:
-            self._send_ping_packets(
-                ctx['ssh_sender'], ctx['peer_ip'], 100, 1)
+            self._flood_udp_dataplane(
+                ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], 5000)
         except Exception as exc:
-            LOG.warning('Expected ping failure while iface down: %s', exc)
-        self._set_ovs_admin_only(sender_hyp, sender_iface, 'up')
+            LOG.warning('UDP flood while iface down finished: %s', exc)
+        restore_sender_iface()
 
         deltas = self._wait_for_induced_errors(
             ctx, baseline_receiver, baseline_sender)
