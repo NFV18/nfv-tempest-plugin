@@ -422,28 +422,6 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             self._ovs_interface_error_exporter_value(current_stats, stat_key) -
             self._ovs_interface_error_exporter_value(baseline_stats, stat_key))
 
-    def _vm_instance_name(self, server):
-        return self.os_admin.servers_client.show_server(
-            server['id'])['server']['OS-EXT-SRV-ATTR:instance_name']
-
-    def _hypervisor_domif_link(self, hypervisor_ip, instance_name,
-                               mac_address, state):
-        """Toggle guest NIC link from the compute hypervisor via virsh."""
-        cmd = (
-            'sudo virsh -c qemu:///system domif-setlink %s %s %s' % (
-                instance_name, mac_address, state))
-        self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
-
-    def _restore_hypervisor_domif_link(self, hypervisor_ip, instance_name,
-                                       mac_address):
-        try:
-            self._hypervisor_domif_link(
-                hypervisor_ip, instance_name, mac_address, 'up')
-        except Exception as exc:
-            LOG.warning(
-                'Failed to restore domif link for %s on %s: %s',
-                mac_address, hypervisor_ip, exc)
-
     def _prom_error_value(self, hypervisor_ip, interface, stat_key):
         metric_name = metrics_base.OVS_INTERFACE_ERROR_STAT_TO_METRIC[stat_key]
         return self._prom_compute_metric_value(
@@ -457,11 +435,13 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def _hypervisor_udp_flood(self, hypervisor_ip, bind_iface, src_ip,
                               dst_ip, packet_count, port=9999):
-        """Send a UDP flood from the hypervisor (for disposable veth tests)."""
+        """Send a UDP flood from the hypervisor bound to a host netdev."""
         script = (
             'import socket\n'
+            'SO_BINDTODEVICE = 25\n'
             's = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n'
             's.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)\n'
+            's.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, %r)\n'
             's.bind((%r, 0))\n'
             'payload = b"x" * 1400\n'
             'dest = (%r, %d)\n'
@@ -470,197 +450,98 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             '        s.sendto(payload, dest)\n'
             '    except OSError:\n'
             '        pass\n'
-            % (src_ip, dst_ip, port, packet_count))
+            % (bind_iface.encode(), src_ip, dst_ip, port, packet_count))
         encoded = base64.b64encode(script.encode('utf-8')).decode('ascii')
         cmd = (
             "sudo timeout 180 sh -c 'echo %s | base64 -d | python3'" % encoded)
         self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
 
-    def _run_vm_error_induces(self, ctx, flood_count):
-        """Try several VM traffic patterns; return baselines and success."""
-        receiver_hyp = ctx['receiver']['hypervisor_ip']
-        sender_hyp = ctx['sender']['hypervisor_ip']
-        receiver_iface = ctx['receiver_iface']
-        sender_iface = ctx['sender_iface']
-        receiver_bind = self._dataplane_bind_ip(ctx['receiver'])
-        receiver_inst = self._vm_instance_name(ctx['receiver'])
-        sender_inst = self._vm_instance_name(ctx['sender'])
+    def _hypervisor_ping_flood(self, hypervisor_ip, iface, dest_ip,
+                               packet_count):
+        """Send a rapid ping burst from a hypervisor netdev."""
+        count = min(max(packet_count // 50, 100), 3000)
+        cmd = (
+            'sudo ping -f -W 1 -c %d -I %s %s 2>/dev/null || true' % (
+                count, iface, dest_ip))
+        self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
 
-        baseline_rx = self._ovs_interface_stats(receiver_hyp, receiver_iface)
-        baseline_tx = self._ovs_interface_stats(sender_hyp, sender_iface)
-        baseline_rx_prom = self._prom_error_value(
-            receiver_hyp, receiver_iface, 'rx_dropped')
-        baseline_tx_prom = self._prom_error_value(
-            sender_hyp, sender_iface, 'tx_errors')
-
-        rx_strategies = (
-            'virsh receiver down + sender flood',
-            'guest receiver down + sender flood',
-            'receiver OVS down + sender flood',
-        )
-        tx_strategies = (
-            'virsh sender down + receiver flood',
-            'guest sender down + receiver flood',
-            'sender OVS link down + sender flood',
-        )
-
-        rx_ok = False
-        for name in rx_strategies:
-            LOG.warning('Trying rx_dropped induce: %s', name)
+    def _attach_error_test_veth(self, hypervisor_ip, preferred_bridge, iface):
+        """Attach disposable veth to the VM bridge or a fallback kernel bridge."""
+        self._cleanup_test_interface(hypervisor_ip, iface)
+        if preferred_bridge:
             try:
-                if name.startswith('virsh receiver'):
-                    try:
-                        self._hypervisor_domif_link(
-                            receiver_hyp, receiver_inst,
-                            ctx['receiver_mac'], 'down')
-                        time.sleep(1)
-                        self._flood_udp_dataplane(
-                            ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'],
-                            flood_count)
-                    finally:
-                        self._restore_hypervisor_domif_link(
-                            receiver_hyp, receiver_inst, ctx['receiver_mac'])
-                elif name.startswith('guest receiver'):
-                    try:
-                        self._set_guest_iface_link(
-                            ctx['ssh_receiver'], ctx['receiver_mac'], 'down')
-                        time.sleep(1)
-                        self._flood_udp_dataplane(
-                            ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'],
-                            flood_count)
-                    finally:
-                        self._restore_guest_iface_link(
-                            ctx['ssh_receiver'], ctx['receiver_mac'])
-                else:
-                    try:
-                        self._set_ovs_oper_state(
-                            receiver_hyp, receiver_iface, 'down', 'down')
-                        time.sleep(1)
-                        self._flood_udp_dataplane(
-                            ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'],
-                            flood_count)
-                    finally:
-                        self._restore_ovs_interface(
-                            receiver_hyp, receiver_iface)
+                self._create_test_interface_on_bridge(
+                    hypervisor_ip, preferred_bridge, iface)
+                return preferred_bridge
             except Exception as exc:
-                LOG.warning('rx_dropped strategy %s failed: %s', name, exc)
-            receiver_stats = self._ovs_interface_stats(
-                receiver_hyp, receiver_iface)
-            rx_prom = self._prom_error_value(
-                receiver_hyp, receiver_iface, 'rx_dropped')
-            progress = self._error_progress(
-                baseline_rx, receiver_stats, baseline_rx_prom, rx_prom,
-                'rx_dropped')
-            self._log_error_induce_stats(
-                'RX %s' % name, baseline_rx, receiver_stats, 'rx_dropped')
-            if progress > 0:
-                rx_ok = True
-                LOG.warning('rx_dropped induce succeeded via %s', name)
-                break
-
-        tx_ok = False
-        for name in tx_strategies:
-            LOG.warning('Trying tx_errors induce: %s', name)
-            try:
-                if name.startswith('virsh sender'):
-                    try:
-                        self._hypervisor_domif_link(
-                            sender_hyp, sender_inst, ctx['sender_mac'], 'down')
-                        time.sleep(1)
-                        self._flood_udp_dataplane(
-                            ctx['ssh_receiver'], receiver_bind,
-                            ctx['bind_ip'], flood_count)
-                    finally:
-                        self._restore_hypervisor_domif_link(
-                            sender_hyp, sender_inst, ctx['sender_mac'])
-                elif name.startswith('guest sender'):
-                    try:
-                        self._set_guest_iface_link(
-                            ctx['ssh_sender'], ctx['sender_mac'], 'down')
-                        time.sleep(1)
-                        self._flood_udp_dataplane(
-                            ctx['ssh_receiver'], receiver_bind,
-                            ctx['bind_ip'], flood_count)
-                    finally:
-                        self._restore_guest_iface_link(
-                            ctx['ssh_sender'], ctx['sender_mac'])
-                else:
-                    try:
-                        self._set_ovs_oper_state(
-                            sender_hyp, sender_iface, 'up', 'down')
-                        time.sleep(1)
-                        self._flood_udp_dataplane(
-                            ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'],
-                            flood_count)
-                    finally:
-                        self._restore_ovs_interface(sender_hyp, sender_iface)
-            except Exception as exc:
-                LOG.warning('tx_errors strategy %s failed: %s', name, exc)
-            sender_stats = self._ovs_interface_stats(sender_hyp, sender_iface)
-            tx_prom = self._prom_error_value(
-                sender_hyp, sender_iface, 'tx_errors')
-            progress = self._error_progress(
-                baseline_tx, sender_stats, baseline_tx_prom, tx_prom,
-                'tx_errors')
-            self._log_error_induce_stats(
-                'TX %s' % name, baseline_tx, sender_stats, 'tx_errors')
-            if progress > 0:
-                tx_ok = True
-                LOG.warning('tx_errors induce succeeded via %s', name)
-                break
-
-        return baseline_rx, baseline_tx, rx_ok and tx_ok
+                LOG.warning(
+                    'Could not attach %s to bridge %s on %s (%s); trying '
+                    'fallback bridges',
+                    iface, preferred_bridge, hypervisor_ip, exc)
+        return self._create_test_interface(hypervisor_ip, iface)
 
     def _run_veth_error_induces(self, hypervisor_ip, bridge, flood_count):
         """Induce rx_dropped/tx_errors on a disposable kernel veth port."""
         iface = ERROR_VETH_IFACE
         self._assert_valid_ifnames(iface)
-        self._cleanup_test_interface(hypervisor_ip, iface)
-        self._create_test_interface_on_bridge(hypervisor_ip, bridge, iface)
+        bridge = self._attach_error_test_veth(
+            hypervisor_ip, bridge, iface)
         self.addCleanup(
             self._delete_test_interface, hypervisor_ip, bridge, iface)
         peer = self._veth_peer_name(iface)
-        src_ip = '198.18.99.1'
-        dst_ip = '198.18.99.2'
+        peer_ip = '198.18.99.1'
+        iface_ip = '198.18.99.2'
+        remote_ip = '198.18.99.3'
         self._ssh_run_on_hypervisor(
             hypervisor_ip,
             'sudo ip addr add %s/32 dev %s 2>/dev/null || true' % (
-                src_ip, peer))
+                peer_ip, peer))
+        self._ssh_run_on_hypervisor(
+            hypervisor_ip,
+            'sudo ip addr add %s/32 dev %s 2>/dev/null || true' % (
+                iface_ip, iface))
 
-        def restore_peer_addr():
+        def restore_addrs():
             self._ssh_run_unchecked_on_hypervisor(
                 hypervisor_ip,
+                'sudo ip addr del %s/32 dev %s 2>/dev/null || true; '
                 'sudo ip addr del %s/32 dev %s 2>/dev/null || true' % (
-                    src_ip, peer))
+                    peer_ip, peer, iface_ip, iface))
 
-        self.addCleanup(restore_peer_addr)
+        self.addCleanup(restore_addrs)
         self._ensure_port_up(hypervisor_ip, iface)
 
         baseline_rx = self._ovs_interface_stats(hypervisor_ip, iface)
+        baseline_rx_prom = self._prom_error_value(
+            hypervisor_ip, iface, 'rx_dropped')
         self._set_ovs_admin_only(hypervisor_ip, iface, 'down')
         time.sleep(1)
         LOG.warning(
-            'Veth rx_dropped induce: flood into admin-down %s on %s:%s',
+            'Veth rx_dropped induce: ping+UDP into admin-down %s on %s:%s',
             iface, hypervisor_ip, bridge)
+        self._hypervisor_ping_flood(
+            hypervisor_ip, peer, iface_ip, flood_count)
         self._hypervisor_udp_flood(
-            hypervisor_ip, peer, src_ip, dst_ip, flood_count)
+            hypervisor_ip, peer, peer_ip, iface_ip, flood_count)
         self._ensure_port_up(hypervisor_ip, iface)
 
         baseline_tx = self._ovs_interface_stats(hypervisor_ip, iface)
+        baseline_tx_prom = self._prom_error_value(
+            hypervisor_ip, iface, 'tx_errors')
         self._set_interface_link_state(hypervisor_ip, iface, 'down')
         time.sleep(1)
         LOG.warning(
-            'Veth tx_errors induce: flood with link-down %s on %s:%s',
+            'Veth tx_errors induce: ping -I link-down %s on %s:%s',
             iface, hypervisor_ip, bridge)
-        self._hypervisor_udp_flood(
-            hypervisor_ip, peer, src_ip, dst_ip, flood_count)
+        self._hypervisor_ping_flood(
+            hypervisor_ip, iface, remote_ip, flood_count)
         self._ensure_port_up(hypervisor_ip, iface)
 
         after = self._ovs_interface_stats(hypervisor_ip, iface)
         self._log_error_induce_stats(
-            'Veth combined induce', baseline_rx, after, 'rx_dropped')
+            'Veth rx induce', baseline_rx, after, 'rx_dropped')
         self._log_error_induce_stats(
-            'Veth combined induce', baseline_tx, after, 'tx_errors')
+            'Veth tx induce', baseline_tx, after, 'tx_errors')
 
         veth_ctx = {
             'receiver': {'hypervisor_ip': hypervisor_ip},
@@ -668,7 +549,8 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             'receiver_iface': iface,
             'sender_iface': iface,
         }
-        return veth_ctx, baseline_rx, baseline_tx
+        return (veth_ctx, baseline_rx, baseline_tx,
+                baseline_rx_prom, baseline_tx_prom)
 
     def _wait_for_induced_errors(self, ctx, baseline_rx, baseline_tx,
                                  baseline_rx_prom=None, baseline_tx_prom=None):
@@ -744,7 +626,12 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
                 time.sleep(metrics_base.METRIC_RETRY_INTERVAL)
         self.fail(
             'Timed out waiting for induced ovs_interface error counters. '
-            'Last %s; last error: %s' % (last, last_exc))
+            'Last %s; last error: %s; diagnostics: %s' % (
+                last, last_exc,
+                self._ovs_interface_diagnostic(
+                    receiver_hyp,
+                    self._port_bridge(receiver_hyp, receiver_iface),
+                    receiver_iface)))
 
     # --- Presence: one Tempest result per error metric ---
 
@@ -771,7 +658,13 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
     # --- Traffic: induce rx_dropped and tx_errors ---
 
     def test_ovs_interface_error_counters_with_vm_traffic(self):
-        """Boot two VMs, induce rx_dropped and tx_errors, verify alignment."""
+        """Boot two VMs, verify dataplane traffic, induce error counters.
+
+        vhost-user VM ports do not reliably expose incrementing rx_dropped or
+        tx_errors counters under guest traffic. After VM ping sanity, error
+        counter growth is validated on a disposable kernel veth attached to
+        the same compute bridge.
+        """
         ctx = self._prepare_traffic_context()
         if ':' in ctx['peer_ip']:
             raise unittest.SkipTest(
@@ -782,21 +675,19 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             self._min_expected_packets())
 
         flood_count = CONF.nfv_plugin_options.network_exporter_error_udp_flood_packets
-        baseline_rx, baseline_tx, vm_ok = self._run_vm_error_induces(
-            ctx, flood_count)
-        if not vm_ok:
-            hypervisor_ip = ctx['sender']['hypervisor_ip']
-            bridge = self._port_bridge(
-                hypervisor_ip, ctx['sender_iface'])
-            LOG.warning(
-                'VM vhost-user error counters did not move after all '
-                'induce strategies; validating on disposable veth %s under '
-                'bridge %s on %s',
-                ERROR_VETH_IFACE, bridge, hypervisor_ip)
-            ctx, baseline_rx, baseline_tx = self._run_veth_error_induces(
-                hypervisor_ip, bridge, flood_count)
+        hypervisor_ip = ctx['sender']['hypervisor_ip']
+        bridge = self._port_bridge(hypervisor_ip, ctx['sender_iface'])
+        LOG.warning(
+            'Inducing ovs_interface error counters on disposable veth %s '
+            '(VM bridge %s on %s) after dataplane ping',
+            ERROR_VETH_IFACE, bridge, hypervisor_ip)
+        (veth_ctx, baseline_rx, baseline_tx,
+         baseline_rx_prom, baseline_tx_prom) = self._run_veth_error_induces(
+            hypervisor_ip, bridge, flood_count)
 
-        deltas = self._wait_for_induced_errors(ctx, baseline_rx, baseline_tx)
+        deltas = self._wait_for_induced_errors(
+            veth_ctx, baseline_rx, baseline_tx,
+            baseline_rx_prom, baseline_tx_prom)
         LOG.warning(
             'OVS error counters OK: rx_dropped +%s rx_dropped_delta, '
             'tx_errors +%s',
