@@ -59,6 +59,18 @@ OVS_INTERFACE_STAT_TO_METRIC = {
     'rx_bytes': OVS_INTERFACE_RX_BYTES_METRIC,
     'tx_bytes': OVS_INTERFACE_TX_BYTES_METRIC,
 }
+OVS_INTERFACE_RX_ERRORS_METRIC = 'ovs_interface_rx_errors'
+OVS_INTERFACE_RX_DROPPED_METRIC = 'ovs_interface_rx_dropped'
+OVS_INTERFACE_TX_ERRORS_METRIC = 'ovs_interface_tx_errors'
+OVS_INTERFACE_TX_RETRIES_METRIC = 'ovs_interface_tx_retries'
+OVS_INTERFACE_ERROR_STAT_TO_METRIC = {
+    'rx_errors': OVS_INTERFACE_RX_ERRORS_METRIC,
+    'rx_dropped': OVS_INTERFACE_RX_DROPPED_METRIC,
+    'tx_errors': OVS_INTERFACE_TX_ERRORS_METRIC,
+    'tx_retries': OVS_INTERFACE_TX_RETRIES_METRIC,
+}
+OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC = 'ovnc_router_port_traffic_pkts'
+OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC = 'ovnc_router_port_traffic_bytes'
 NET_VF_INFO_METRIC = 'net_vf_info'
 NET_VF_RECEIVE_PACKETS_METRIC = 'net_vf_receive_packets_total'
 NET_VF_TRANSMIT_PACKETS_METRIC = 'net_vf_transmit_packets_total'
@@ -342,6 +354,116 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         else:
             detail = 'slow ping path failed'
         self.fail('Ping to %s failed: %s' % (dest_ip, detail))
+
+    def _guest_sudo_prefix(self, ssh_client):
+        """Return sudo -n prefix when passwordless sudo is available."""
+        return 'sudo -n' if self._guest_has_passwordless_sudo(ssh_client) else ''
+
+    def _run_guest_python_script(self, ssh_client, script, timeout_sec=60):
+        """Run a Python script on the guest via base64 pipe (avoids quoting)."""
+        encoded = base64.b64encode(script.encode('utf-8')).decode('ascii')
+        cmd = 'timeout %d sh -c \'echo %s | base64 -d | python3\'' % (
+            timeout_sec, encoded)
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if sudo:
+            cmd = '%s %s' % (sudo, cmd)
+        return ssh_client.exec_command(cmd)
+
+    def _send_ping_packets_bound(self, ssh_client, bind_ip, dest_ip, count,
+                                 min_packets):
+        """Send ICMP echo requests bound to a specific source address."""
+        errors = []
+        if self._guest_has_passwordless_sudo(ssh_client):
+            for template in (
+                    'timeout %d sudo -n ping -c %d -I %s -i %g -W 2 %s',
+                    'ping -c %d -I %s -i %g -W 2 %s'):
+                if 'sudo' in template:
+                    wall = max(30, int(count * PING_FAST_INTERVAL_SEC) + 15)
+                    cmd = template % (
+                        wall, count, bind_ip, PING_FAST_INTERVAL_SEC, dest_ip)
+                else:
+                    cmd = template % (
+                        count, bind_ip, PING_FAST_INTERVAL_SEC, dest_ip)
+                LOG.warning('Sending bound ping: %s', cmd)
+                try:
+                    output = ssh_client.exec_command(cmd)
+                except Exception as exc:
+                    errors.append('%s -> %s' % (cmd, exc))
+                    continue
+                if '100% packet loss' not in (output or ''):
+                    return output
+                errors.append('%s -> 100%% packet loss' % cmd)
+        wall = min(PING_MAX_WALL_SECONDS,
+                   max(30, int(count * PING_SLOW_INTERVAL_SEC) + 15))
+        capped = min(count, int(wall / PING_SLOW_INTERVAL_SEC))
+        if capped < min_packets:
+            self.fail(
+                'Bound ping count %d below minimum %d without passwordless '
+                'sudo (cap %d at %gs interval)' % (
+                    capped, min_packets, capped, PING_SLOW_INTERVAL_SEC))
+        cmd = 'timeout %d ping -c %d -I %s -i %g -W 2 %s' % (
+            wall, capped, bind_ip, PING_SLOW_INTERVAL_SEC, dest_ip)
+        LOG.warning('Sending bound ping (slow path): %s', cmd)
+        try:
+            output = ssh_client.exec_command(cmd)
+        except Exception as exc:
+            errors.append('%s -> %s' % (cmd, exc))
+        else:
+            if '100% packet loss' not in (output or ''):
+                return output
+            errors.append('%s -> 100%% packet loss' % cmd)
+        detail = '; '.join(errors) if errors else 'bound ping failed'
+        self.fail('Ping from %s to %s failed: %s' % (bind_ip, dest_ip, detail))
+
+    def _assert_ovs_interface_metric_reported(self, metric_name):
+        """Assert metric on openstack metric show, compute :9105, metric-storage."""
+        stdout, stderr, returncode = self._metric_show(metric_name)
+        stdout = stdout or ''
+        if self._metric_show_output_usable(metric_name, stdout):
+            LOG.info(
+                "Metric '%s' reported via openstack metric show or "
+                "metric-storage fallback", metric_name)
+        else:
+            LOG.warning(
+                "openstack metric show unavailable for '%s' (exit %s: %s); "
+                "falling back to compute :9105 SSH scrape",
+                metric_name, returncode, stderr)
+            self._assert_metric_on_compute_scrape(metric_name)
+        storage_samples, query_error = self._metric_storage_samples(metric_name)
+        self.assertNotEmpty(
+            storage_samples,
+            '%s missing from metric-storage Prometheus (query: %s)' % (
+                metric_name, query_error))
+
+    def _assert_router_port_metric_reported(self, metric_name):
+        """Assert ovnc_router_port_traffic_* on compute :9105 and metric-storage."""
+        self._assert_metric_on_compute_scrape(metric_name)
+        storage_samples, query_error = self._metric_storage_samples(metric_name)
+        self.assertNotEmpty(
+            storage_samples,
+            '%s missing from metric-storage Prometheus (query: %s)' % (
+                metric_name, query_error))
+
+    def _router_port_label_key(self, labels):
+        """Stable identity for ovnc_router_port_traffic series."""
+        return (labels.get('datapath'), labels.get('port'))
+
+    def _prom_router_port_samples(self, hypervisor_ip, metric_name):
+        """Return all router-port metric samples from compute :9105."""
+        output = self._scrape_compute_metrics_text(hypervisor_ip)
+        return self._parse_prom_samples(output, metric_name)
+
+    def _router_port_sample_map(self, hypervisor_ip, metric_name, storage=False):
+        """Map (datapath, port) -> value from :9105 or metric-storage."""
+        if storage:
+            samples, _ = self._metric_storage_samples(
+                metric_name, hypervisor_ip=hypervisor_ip)
+        else:
+            samples = self._prom_router_port_samples(hypervisor_ip, metric_name)
+        return {
+            self._router_port_label_key(sample['labels']): sample['value']
+            for sample in samples
+        }
 
     def _assert_metric_on_compute_scrape(self, metric_name):
         """Verify metric_name is exported on at least one compute :9105 scrape."""

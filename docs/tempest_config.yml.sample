@@ -80,10 +80,20 @@ test-networks:
 # uses L2); this avoids Neutron BadRequest when multiple subnets share a CIDR.
 # Guests need passwordless sudo for fast ICMP (network_exporter_traffic_ping_count
 # defaults to 5000); otherwise lower the ping count or grant sudo in the guest image.
+# network_exporter_ovs_interface_errors uses the same network layout as generic
+# traffic (mgmt + one shared normal dataplane net) and passwordless sudo for UDP
+# flood / ping during error induce.
+# network_exporter_router_traffic needs mgmt plus at least one other normal
+# test-network with a distinct CIDR; both subnets are attached to the Neutron
+# router (test_networks_only). Cross-subnet ICMP drives ovnc_router_port_traffic_*.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor
   - name: network_exporter_generic_traffic
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_ovs_interface_errors
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_router_traffic
     flavor: nfv_qe_base_flavor
 
 # Flavors used by the test.

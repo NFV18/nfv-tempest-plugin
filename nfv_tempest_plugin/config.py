@@ -130,6 +130,11 @@ NfvPluginOptions = [
                default=64,
                help='Minimum expected byte delta per counted packet when '
                     'validating tx/rx_bytes increases.'),
+    cfg.IntOpt('network_exporter_error_udp_flood_packets',
+               default=50000,
+               help='UDP datagrams sent at high rate to a peer dataplane IP '
+                    'without a listener, to induce ovs_interface_rx_dropped '
+                    'increases on the receiver OVS port.'),
     cfg.StrOpt('network_exporter_sriov_physnet',
                default='',
                help='SR-IOV physnet name from tempest_config.yml test-networks '

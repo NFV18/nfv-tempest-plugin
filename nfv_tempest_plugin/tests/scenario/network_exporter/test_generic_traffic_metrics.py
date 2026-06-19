@@ -108,26 +108,6 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         return (self._min_expected_packets() *
                 CONF.nfv_plugin_options.network_exporter_traffic_min_bytes_per_packet)
 
-    def _assert_ovs_interface_metric_reported(self, metric_name):
-        """Assert metric on openstack metric show, compute :9105, metric-storage."""
-        stdout, stderr, returncode = self._metric_show(metric_name)
-        stdout = stdout or ''
-        if self._metric_show_output_usable(metric_name, stdout):
-            LOG.info(
-                "Metric '%s' reported via openstack metric show or "
-                "metric-storage fallback", metric_name)
-        else:
-            LOG.warning(
-                "openstack metric show unavailable for '%s' (exit %s: %s); "
-                "falling back to compute :9105 SSH scrape",
-                metric_name, returncode, stderr)
-            self._assert_metric_on_compute_scrape(metric_name)
-        storage_samples, query_error = self._metric_storage_samples(metric_name)
-        self.assertNotEmpty(
-            storage_samples,
-            '%s missing from metric-storage Prometheus (query: %s)' % (
-                metric_name, query_error))
-
     def _populate_provider_networks(self, servers):
         """Attach provider network metadata used to find peer IPs."""
         for server in servers:
