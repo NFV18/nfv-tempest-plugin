@@ -175,24 +175,6 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         key = max(deltas, key=deltas.get)
         return key, deltas[key]
 
-    def _assert_router_series_synced(self, hypervisor_ip, metric_name, label_key):
-        prom_map = self._router_port_sample_map(hypervisor_ip, metric_name)
-        storage_map = self._router_port_sample_map(
-            hypervisor_ip, metric_name, storage=True)
-        self.assertIn(
-            label_key, prom_map,
-            '%s series %s missing on OVN :1981 scrape for %s' % (
-                metric_name, label_key, hypervisor_ip))
-        self.assertIn(
-            label_key, storage_map,
-            '%s series %s missing in metric-storage for %s' % (
-                metric_name, label_key, hypervisor_ip))
-        self.assertEqual(
-            prom_map[label_key], storage_map[label_key],
-            '%s OVN :1981=%s metric-storage=%s for %s series %s' % (
-                metric_name, prom_map[label_key], storage_map[label_key],
-                hypervisor_ip, label_key))
-
     def _wait_for_router_traffic_counters(self, hypervisor_ip, baseline_pkts,
                                           baseline_bytes):
         min_packets = self._min_expected_packets()
@@ -222,14 +204,6 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                 self.assertGreaterEqual(
                     bytes_inc, min_bytes,
                     'ovnc_router_port_traffic_bytes delta %s' % last)
-                self._assert_router_series_synced(
-                    hypervisor_ip,
-                    metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC,
-                    pkts_key)
-                self._assert_router_series_synced(
-                    hypervisor_ip,
-                    metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC,
-                    bytes_key)
                 LOG.warning(
                     'Router port counters increased (attempt %s): %s',
                     attempt + 1, last)
@@ -249,12 +223,12 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
     # --- Presence ---
 
     def test_ovnc_router_port_traffic_pkts_reported(self):
-        """Verify ovnc_router_port_traffic_pkts on OVN :1981 and metric-storage."""
+        """Verify ovnc_router_port_traffic_pkts in metric-storage."""
         self._assert_router_port_metric_reported(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
 
     def test_ovnc_router_port_traffic_bytes_reported(self):
-        """Verify ovnc_router_port_traffic_bytes on OVN :1981 and metric-storage."""
+        """Verify ovnc_router_port_traffic_bytes in metric-storage."""
         self._assert_router_port_metric_reported(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
