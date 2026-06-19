@@ -767,6 +767,21 @@ class ManagerMixin(object):
             return 0
         return int(value)
 
+    def _ovs_interface_error_exporter_value(self, stats, stat_key):
+        """Return OVS error counter as openstack-network-exporter iface does."""
+        if stat_key == 'rx_dropped':
+            missed = self._ovs_interface_stat_int(stats, 'rx_missed_errors')
+            if missed > 0:
+                return missed
+            return self._ovs_interface_stat_int(stats, 'rx_dropped')
+        if stat_key == 'tx_errors':
+            failures = self._ovs_interface_stat_int(
+                stats, 'ovs_tx_failure_drops')
+            if failures > 0:
+                return failures
+            return self._ovs_interface_stat_int(stats, 'tx_errors')
+        return self._ovs_interface_stat_int(stats, stat_key)
+
     def get_ovs_multicast_groups(self, switch, multicast_ip=None,
                                  hypervisor=None):
         """This method get ovs multicast groups

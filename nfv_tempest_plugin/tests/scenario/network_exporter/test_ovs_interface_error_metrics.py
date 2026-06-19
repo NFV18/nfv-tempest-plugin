@@ -154,6 +154,77 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             return net['ip_address']
         self.fail('No dataplane IP for VM %s' % server.get('name', server['id']))
 
+    def _dataplane_provider_net(self, server):
+        mgmt_net_id = self._mgmt_network_id()
+        for net in server['provider_networks']:
+            if mgmt_net_id and net['network_id'] == mgmt_net_id:
+                continue
+            return net
+        for net in server['provider_networks']:
+            return net
+        self.fail(
+            'No dataplane provider network for VM %s' % (
+                server.get('name', server['id'])))
+
+    def _lookup_guest_iface_by_mac(self, ssh_client, mac_address):
+        mac = mac_address.lower()
+        cmd = (
+            "ip -o link | grep -i '%s' | awk -F': ' '{print $2; exit}'" % mac)
+        raw = ssh_client.exec_command(cmd).strip()
+        return raw.split('@')[0].strip() if raw else None
+
+    def _maybe_shrink_guest_rx_ring(self, ssh_client, mac_address):
+        """Temporarily shrink RX ring on guest dataplane NIC to ease RX drops."""
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if not sudo:
+            LOG.warning(
+                'No passwordless sudo on guest; skipping RX ring shrink')
+            return None
+        iface = self._lookup_guest_iface_by_mac(ssh_client, mac_address)
+        if not iface:
+            LOG.warning(
+                'Could not resolve guest iface for MAC %s; skipping RX shrink',
+                mac_address)
+            return None
+        ssh_client.exec_command(
+            '%s ethtool -G %s rx 32 2>/dev/null || '
+            '%s ethtool -G %s rx 64 2>/dev/null || true' % (
+                sudo, iface, sudo, iface))
+
+        def restore():
+            ssh_client.exec_command(
+                '%s ethtool -G %s rx 512 2>/dev/null || true' % (
+                    sudo, iface))
+
+        self.addCleanup(restore)
+        return iface
+
+    def _maybe_shrink_guest_tx_ring(self, ssh_client, mac_address):
+        """Temporarily shrink TX ring on guest dataplane NIC to ease TX drops."""
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if not sudo:
+            LOG.warning(
+                'No passwordless sudo on guest; skipping TX ring shrink')
+            return None
+        iface = self._lookup_guest_iface_by_mac(ssh_client, mac_address)
+        if not iface:
+            LOG.warning(
+                'Could not resolve guest iface for MAC %s; skipping TX shrink',
+                mac_address)
+            return None
+        ssh_client.exec_command(
+            '%s ethtool -G %s tx 32 2>/dev/null || '
+            '%s ethtool -G %s tx 64 2>/dev/null || true' % (
+                sudo, iface, sudo, iface))
+
+        def restore():
+            ssh_client.exec_command(
+                '%s ethtool -G %s tx 512 2>/dev/null || true' % (
+                    sudo, iface))
+
+        self.addCleanup(restore)
+        return iface
+
     def _resolve_ovs_interface(self, server):
         if server.get('other_port'):
             return server['other_port']
@@ -205,7 +276,8 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
     def _assert_error_stat_match_ovs(self, hypervisor_ip, interface,
                                      stat_key, ovs_stats):
         metric_name = metrics_base.OVS_INTERFACE_ERROR_STAT_TO_METRIC[stat_key]
-        ovs_value = self._ovs_interface_stat_int(ovs_stats, stat_key)
+        ovs_value = self._ovs_interface_error_exporter_value(
+            ovs_stats, stat_key)
         prom = self._prom_compute_metric_value(
             hypervisor_ip, metric_name, {'interface': interface})
         storage = self._storage_counter_value(
@@ -263,6 +335,10 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
         bind_ip = self._dataplane_bind_ip(sender)
         ssh_sender = self.get_remote_client(
             sender['fip'], self.instance_user, key_pair['private_key'])
+        ssh_receiver = self.get_remote_client(
+            receiver['fip'], self.instance_user, key_pair['private_key'])
+        receiver_net = self._dataplane_provider_net(receiver)
+        sender_net = self._dataplane_provider_net(sender)
         return {
             'sender': sender,
             'receiver': receiver,
@@ -271,10 +347,61 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             'peer_ip': peer_ip,
             'bind_ip': bind_ip,
             'ssh_sender': ssh_sender,
+            'ssh_receiver': ssh_receiver,
+            'receiver_mac': receiver_net['mac_address'],
+            'sender_mac': sender_net['mac_address'],
             'key_pair': key_pair,
         }
 
-    def _wait_for_induced_errors(self, ctx, baseline_receiver, baseline_sender):
+    def _error_counter_delta(self, current_stats, baseline_stats, stat_key):
+        return (
+            self._ovs_interface_error_exporter_value(current_stats, stat_key) -
+            self._ovs_interface_error_exporter_value(baseline_stats, stat_key))
+
+    def _induce_rx_dropped(self, ctx, flood_count):
+        """Shrink receiver RX ring and flood peer to overflow vhost RX queue."""
+        receiver_hyp = ctx['receiver']['hypervisor_ip']
+        baseline = self._ovs_interface_stats(
+            receiver_hyp, ctx['receiver_iface'])
+        self._maybe_shrink_guest_rx_ring(
+            ctx['ssh_receiver'], ctx['receiver_mac'])
+        LOG.warning(
+            'Inducing rx_dropped: %d UDP datagrams %s -> %s (receiver %s:%s)',
+            flood_count, ctx['bind_ip'], ctx['peer_ip'],
+            receiver_hyp, ctx['receiver_iface'])
+        self._flood_udp_dataplane(
+            ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], flood_count)
+        return baseline
+
+    def _induce_tx_errors(self, ctx, flood_count):
+        """Disable sender OVS link and flood TX to increment failure drops."""
+        sender_hyp = ctx['sender']['hypervisor_ip']
+        sender_iface = ctx['sender_iface']
+        baseline = self._ovs_interface_stats(sender_hyp, sender_iface)
+
+        def restore_sender_iface():
+            self._set_interface_link_state(sender_hyp, sender_iface, 'up')
+            self._set_ovs_admin_only(sender_hyp, sender_iface, 'up')
+
+        self.addCleanup(restore_sender_iface)
+        self._maybe_shrink_guest_tx_ring(
+            ctx['ssh_sender'], ctx['sender_mac'])
+        LOG.warning(
+            'Inducing tx_errors: admin/link down on %s:%s during %d UDP '
+            'datagrams %s -> %s',
+            sender_hyp, sender_iface, flood_count,
+            ctx['bind_ip'], ctx['peer_ip'])
+        self._set_ovs_admin_only(sender_hyp, sender_iface, 'down')
+        self._set_interface_link_state(sender_hyp, sender_iface, 'down')
+        try:
+            self._flood_udp_dataplane(
+                ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], flood_count)
+        except Exception as exc:
+            LOG.warning('UDP flood while iface down finished: %s', exc)
+        restore_sender_iface()
+        return baseline
+
+    def _wait_for_induced_errors(self, ctx, baseline_rx, baseline_tx):
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
@@ -282,17 +409,21 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
                 ctx['receiver']['hypervisor_ip'], ctx['receiver_iface'])
             sender_stats = self._ovs_interface_stats(
                 ctx['sender']['hypervisor_ip'], ctx['sender_iface'])
-            rx_drop_delta = (
-                self._ovs_interface_stat_int(receiver_stats, 'rx_dropped') -
-                self._ovs_interface_stat_int(baseline_receiver, 'rx_dropped'))
-            tx_err_delta = (
-                self._ovs_interface_stat_int(sender_stats, 'tx_errors') -
-                self._ovs_interface_stat_int(baseline_sender, 'tx_errors'))
+            rx_drop_delta = self._error_counter_delta(
+                receiver_stats, baseline_rx, 'rx_dropped')
+            tx_err_delta = self._error_counter_delta(
+                sender_stats, baseline_tx, 'tx_errors')
             last = {
                 'rx_dropped_delta': rx_drop_delta,
                 'tx_errors_delta': tx_err_delta,
-                'receiver_stats_keys': sorted(receiver_stats.keys()),
-                'sender_stats_keys': sorted(sender_stats.keys()),
+                'receiver_rx_dropped': self._ovs_interface_stat_int(
+                    receiver_stats, 'rx_dropped'),
+                'receiver_rx_missed_errors': self._ovs_interface_stat_int(
+                    receiver_stats, 'rx_missed_errors'),
+                'sender_tx_errors': self._ovs_interface_stat_int(
+                    sender_stats, 'tx_errors'),
+                'sender_ovs_tx_failure_drops': self._ovs_interface_stat_int(
+                    sender_stats, 'ovs_tx_failure_drops'),
             }
             try:
                 self.assertGreater(
@@ -354,44 +485,15 @@ class TestOvsInterfaceErrorMetrics(metrics_base.NetworkExporterMetricsBase):
             raise unittest.SkipTest(
                 'OVS error induce tests currently require IPv4 dataplane peers')
 
-        baseline_receiver = self._ovs_interface_stats(
-            ctx['receiver']['hypervisor_ip'], ctx['receiver_iface'])
-        baseline_sender = self._ovs_interface_stats(
-            ctx['sender']['hypervisor_ip'], ctx['sender_iface'])
-
         self._send_ping_packets(
             ctx['ssh_sender'], ctx['peer_ip'], self._traffic_ping_count(),
             self._min_expected_packets())
 
         flood_count = CONF.nfv_plugin_options.network_exporter_error_udp_flood_packets
-        LOG.warning(
-            'Inducing rx_dropped: %d UDP datagrams %s -> %s',
-            flood_count, ctx['bind_ip'], ctx['peer_ip'])
-        self._flood_udp_dataplane(
-            ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], flood_count)
+        baseline_rx = self._induce_rx_dropped(ctx, flood_count)
+        baseline_tx = self._induce_tx_errors(ctx, flood_count)
 
-        sender_hyp = ctx['sender']['hypervisor_ip']
-        sender_iface = ctx['sender_iface']
-
-        def restore_sender_iface():
-            self._set_interface_link_state(sender_hyp, sender_iface, 'up')
-            self._set_ovs_admin_only(sender_hyp, sender_iface, 'up')
-
-        self.addCleanup(restore_sender_iface)
-        LOG.warning(
-            'Inducing tx_errors: admin/link down on %s:%s during UDP flood',
-            sender_hyp, sender_iface)
-        self._set_ovs_admin_only(sender_hyp, sender_iface, 'down')
-        self._set_interface_link_state(sender_hyp, sender_iface, 'down')
-        try:
-            self._flood_udp_dataplane(
-                ctx['ssh_sender'], ctx['bind_ip'], ctx['peer_ip'], 5000)
-        except Exception as exc:
-            LOG.warning('UDP flood while iface down finished: %s', exc)
-        restore_sender_iface()
-
-        deltas = self._wait_for_induced_errors(
-            ctx, baseline_receiver, baseline_sender)
+        deltas = self._wait_for_induced_errors(ctx, baseline_rx, baseline_tx)
         LOG.warning(
             'OVS error counters OK: rx_dropped +%s rx_dropped_delta, '
             'tx_errors +%s',
