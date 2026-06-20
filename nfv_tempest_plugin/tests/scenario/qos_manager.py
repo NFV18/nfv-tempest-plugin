@@ -280,9 +280,11 @@ class QoSManagerMixin(object):
                                  QoSManagerMixin.LOG_5102)
 
         LOG.info('Send iperf traffic from Server1...')
-        shell_utils.iperf_client(ip_addr, 5101, 60, "tcp", ssh_source1)
+        shell_utils.iperf_client(ip_addr, 5101, 60, "tcp", ssh_source1,
+                                 mss=CONF.nfv_plugin_options.iperf_mss)
         LOG.info('Send iperf traffic from Server2...')
-        shell_utils.iperf_client(ip_addr, 5102, 60, "tcp", ssh_source2)
+        shell_utils.iperf_client(ip_addr, 5102, 60, "tcp", ssh_source2,
+                                 mss=CONF.nfv_plugin_options.iperf_mss)
 
         # wait for iperf to finish
         time.sleep(90)
