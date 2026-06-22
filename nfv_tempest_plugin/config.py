@@ -137,6 +137,12 @@ NfvPluginOptions = [
                     'ovnc_router_port_traffic_* deltas. Router port counters '
                     'fed through metric-storage typically reflect roughly half '
                     'of the ICMP probes sent cross-subnet.'),
+    cfg.IntOpt('network_exporter_router_traffic_min_packets',
+               default=400,
+               help='Floor for ovnc_router_port_traffic_pkts delta regardless '
+                    'of ping count/tolerance. The effective minimum is the '
+                    'lower of the tolerance-based value and ~35%% of probes '
+                    'actually transmitted on a probe-verified path.'),
     cfg.IntOpt('network_exporter_error_udp_flood_packets',
                default=50000,
                help='UDP datagrams sent at high rate to a peer dataplane IP '

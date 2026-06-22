@@ -510,9 +510,12 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             return self._send_ping_packets_bound_batched(
                 ssh_client, bind_ip, dest_ip, count, min_packets,
                 accept_xmit_only=accept_xmit_only)
-        return self._send_ping_packets_bound_once(
+        output = self._send_ping_packets_bound_once(
             ssh_client, bind_ip, dest_ip, count, min_packets,
             accept_xmit_only=accept_xmit_only)
+        if accept_xmit_only:
+            return self._parse_ping_transmitted(output)
+        return output
 
     def _send_ping_packets_bound_batched(self, ssh_client, bind_ip, dest_ip,
                                          count, min_packets,
@@ -539,6 +542,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             LOG.warning(
                 'Bound ping xmit-only flood: %d/%d transmitted %s -> %s',
                 total_xmit, count, bind_ip, dest_ip)
+            return total_xmit
         return last_output
 
     def _send_ping_packets_bound_once(self, ssh_client, bind_ip, dest_ip, count,
