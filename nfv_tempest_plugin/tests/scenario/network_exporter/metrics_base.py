@@ -138,9 +138,16 @@ OVS_STATE_UP = 1
 OVS_STATE_DOWN = 0
 NETWORK_EXPORTER_INSTANCE_PORT = ':9105'
 FLOW_COUNT_RE = re.compile(r'flow_count=(\d+)', re.IGNORECASE)
-DPCTL_LOOKUPS_RE = re.compile(
-    r'lookups:\s*hit:(\d+)\s+missed:(\d+)\s+lost:(\d+)', re.IGNORECASE)
-DPCTL_FLOWS_RE = re.compile(r'^\s*flows:\s*(\d+)\s*$', re.MULTILINE)
+DPCTL_DATAPATH_HEADER_RE = re.compile(r'^([\w-]+)@([\w-]+):$')
+DPCTL_LOOKUPS_LINE_RE = re.compile(
+    r'^  lookups:\s*hit:\s*(\d+)\s+missed:\s*(\d+)\s+lost:(\d+)$')
+DPCTL_FLOWS_LINE_RE = re.compile(r'^  flows:\s*(\d+)$')
+DPCTL_SHOW_COMMANDS = (
+    'sudo ovs-appctl dpctl/show 2>/dev/null',
+    'ovs-appctl dpctl/show 2>/dev/null',
+    'sudo ovs-dpctl show -s 2>/dev/null',
+    'sudo ovs-dpctl show 2>/dev/null',
+)
 METRIC_ROW_VALUE_RE = re.compile(r'(\d+)\s*\|?\s*$')
 COMPUTE_METRICS_HOST_RE = re.compile(
     r'(\d+\.\d+\.\d+\.\d+)' + re.escape(NETWORK_EXPORTER_INSTANCE_PORT))
@@ -732,69 +739,122 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
     def _configured_datapath_name(self):
         return CONF.nfv_plugin_options.network_exporter_datapath_name
 
+    def _configured_datapath_type(self):
+        return CONF.nfv_plugin_options.network_exporter_datapath_type
+
+    def _datapath_required_labels(self, datapath=None, datapath_type=None):
+        """Prometheus labels for ovs_datapath_* (exporter uses type,name)."""
+        labels = {
+            'name': datapath or self._configured_datapath_name(),
+        }
+        dtype = (datapath_type if datapath_type is not None
+                 else self._configured_datapath_type())
+        if dtype:
+            labels['type'] = dtype
+        return labels
+
     def _datapath_label_key(self, labels):
         """Stable identity for ovs_datapath_* series."""
-        return labels.get('datapath')
+        return labels.get('name') or labels.get('datapath')
 
-    def _ovs_datapath_dpctl_stats(self, hypervisor_ip, datapath=None):
-        """Parse ovs-dpctl show -s for flows and lookup counters."""
-        datapath = datapath or self._configured_datapath_name()
-        cmd = 'sudo ovs-dpctl show -s 2>/dev/null'
-        output = self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
-        blocks = re.split(r'\n(?=\S)', output)
-        for block in blocks:
-            header = block.splitlines()[0] if block else ''
-            if datapath not in header:
-                continue
-            lookups = DPCTL_LOOKUPS_RE.search(block)
-            flows = DPCTL_FLOWS_RE.search(block)
-            if not lookups or not flows:
-                self.fail(
-                    'Could not parse ovs-dpctl stats for datapath %s on %s: %r'
-                    % (datapath, hypervisor_ip, block[:500]))
-            return {
-                'flows': int(flows.group(1)),
-                'hit': int(lookups.group(1)),
-                'missed': int(lookups.group(2)),
-                'lost': int(lookups.group(3)),
-            }
+    def _ovs_datapath_dpctl_show_output(self, hypervisor_ip):
+        """Fetch dpctl/show text (same source as openstack-network-exporter)."""
+        last_output = ''
+        for cmd in DPCTL_SHOW_COMMANDS:
+            output = self._ssh_run_on_hypervisor(
+                hypervisor_ip, cmd, check_rc=False)
+            if output and output.strip():
+                return output
+            last_output = output or last_output
         self.fail(
-            'Datapath %s not found in ovs-dpctl show on %s' % (
-                datapath, hypervisor_ip))
+            'Could not get dpctl/show output on %s (last output: %r)' % (
+                hypervisor_ip, (last_output or '')[:500]))
 
-    def _datapath_samples(self, hypervisor_ip, metric_name, datapath=None):
-        """Return datapath samples from metric-storage for one hypervisor."""
+    def _ovs_datapath_dpctl_stats(self, hypervisor_ip, datapath=None,
+                                  datapath_type=None):
+        """Parse ovs-appctl dpctl/show for flows and lookup counters."""
         datapath = datapath or self._configured_datapath_name()
+        datapath_type = (datapath_type if datapath_type is not None
+                         else self._configured_datapath_type())
+        output = self._ovs_datapath_dpctl_show_output(hypervisor_ip)
+        current_type = ''
+        current_name = ''
+        found_headers = []
+        target_stats = None
+
+        for line in output.splitlines():
+            header = DPCTL_DATAPATH_HEADER_RE.match(line)
+            if header:
+                current_type, current_name = header.group(1), header.group(2)
+                found_headers.append('%s@%s' % (current_type, current_name))
+                continue
+
+            if current_name != datapath:
+                continue
+            if datapath_type and current_type != datapath_type:
+                continue
+
+            if target_stats is None:
+                target_stats = {}
+
+            lookups = DPCTL_LOOKUPS_LINE_RE.match(line)
+            if lookups:
+                target_stats.update(
+                    hit=int(lookups.group(1)),
+                    missed=int(lookups.group(2)),
+                    lost=int(lookups.group(3)))
+                continue
+            flows = DPCTL_FLOWS_LINE_RE.match(line)
+            if flows:
+                target_stats['flows'] = int(flows.group(1))
+
+        if (target_stats and 'flows' in target_stats and
+                'hit' in target_stats):
+            return target_stats
+
+        self.fail(
+            'Datapath %s@%s not found in dpctl/show on %s (seen %s; output: %r)'
+            % (datapath_type or '*', datapath, hypervisor_ip,
+               found_headers, output[:800]))
+
+    def _datapath_samples(self, hypervisor_ip, metric_name, datapath=None,
+                          datapath_type=None):
+        """Return datapath samples from metric-storage for one hypervisor."""
+        required_labels = self._datapath_required_labels(
+            datapath=datapath, datapath_type=datapath_type)
         samples, error = self._metric_storage_samples(
             metric_name, hypervisor_ip=hypervisor_ip,
-            required_labels={'datapath': datapath})
+            required_labels=required_labels)
         if samples:
             return samples
         LOG.warning(
             'No %s samples in metric-storage for datapath %s on %s (%s); '
             'trying live :9105 scrape',
-            metric_name, datapath, hypervisor_ip, error)
-        labels = {'datapath': datapath}
+            metric_name, required_labels, hypervisor_ip, error)
         prom = self._prom_compute_metric_value(
-            hypervisor_ip, metric_name, labels)
+            hypervisor_ip, metric_name, required_labels)
         if prom is not None:
-            return [{'labels': labels, 'value': prom}]
+            return [{'labels': required_labels, 'value': prom}]
         return self._parse_prom_samples(
             self._scrape_compute_metrics_text(hypervisor_ip), metric_name,
-            required_labels=labels)
+            required_labels=required_labels)
 
-    def _datapath_sample_map(self, hypervisor_ip, metric_name, datapath=None):
-        """Map datapath label -> value from metric-storage Prometheus."""
+    def _datapath_sample_map(self, hypervisor_ip, metric_name, datapath=None,
+                             datapath_type=None):
+        """Map datapath name label -> value from metric-storage Prometheus."""
         return {
             self._datapath_label_key(sample['labels']): sample['value']
             for sample in self._datapath_samples(
-                hypervisor_ip, metric_name, datapath=datapath)
+                hypervisor_ip, metric_name, datapath=datapath,
+                datapath_type=datapath_type)
         }
 
-    def _datapath_metric_value(self, hypervisor_ip, metric_name, datapath=None):
+    def _datapath_metric_value(self, hypervisor_ip, metric_name, datapath=None,
+                               datapath_type=None):
         """Return a single datapath series value for hypervisor_ip."""
         sample_map = self._datapath_sample_map(
-            hypervisor_ip, metric_name, datapath=datapath)
+            hypervisor_ip, metric_name, datapath=datapath,
+            datapath_type=datapath_type)
         datapath = datapath or self._configured_datapath_name()
         if datapath in sample_map:
             return sample_map[datapath]
@@ -811,9 +871,20 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             hypervisors,
             'No compute hypervisors available for datapath metric %s' %
             metric_name)
-        hypervisor_ip = hypervisors[0]
-        self._assert_datapath_matches_dpctl(
-            hypervisor_ip, metric_name, datapath)
+        last_exc = None
+        for hypervisor_ip in hypervisors:
+            try:
+                self._assert_datapath_matches_dpctl(
+                    hypervisor_ip, metric_name, datapath)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'Datapath dpctl check failed on %s for %s: %s',
+                    hypervisor_ip, metric_name, exc)
+        self.fail(
+            'Datapath metric %s did not match dpctl/show on any hypervisor '
+            '%s; last error: %s' % (metric_name, hypervisors, last_exc))
 
     def _assert_datapath_matches_dpctl(self, hypervisor_ip, metric_name,
                                        datapath=None):
