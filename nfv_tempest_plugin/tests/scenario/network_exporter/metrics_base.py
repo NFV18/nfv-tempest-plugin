@@ -141,6 +141,9 @@ LEGACY_STATE_TEST_INTERFACES = (
 PING_FAST_INTERVAL_SEC = 0.001
 PING_SLOW_INTERVAL_SEC = 0.2
 PING_MAX_WALL_SECONDS = 120
+# Routed fast ping needs interval plus RTT per reply; 30s caps ~3k of 5k probes.
+PING_FAST_FLOOD_PER_PACKET_SEC = 0.01
+PING_FAST_FLOOD_MIN_WALL_SECONDS = 90
 
 
 class NetworkExporterMetricsBase(base_test.BaseTest):
@@ -387,6 +390,12 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         except Exception:
             return False
 
+    def _ping_fast_flood_wall_seconds(self, count):
+        """Wall-clock budget for ``ping -c N -i 0.001`` on routed networks."""
+        return max(
+            PING_FAST_FLOOD_MIN_WALL_SECONDS,
+            int(count * PING_FAST_FLOOD_PER_PACKET_SEC) + 30)
+
     def _send_ping_packets(self, ssh_client, dest_ip, count, min_packets):
         """Send ICMP echo requests between guests for traffic counter tests.
 
@@ -400,7 +409,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     'timeout %d sudo -n ping -c %d -i %g -W 2 %s',
                     'ping -c %d -i %g -W 2 %s'):
                 if 'sudo' in template:
-                    wall = max(30, int(count * PING_FAST_INTERVAL_SEC) + 15)
+                    wall = self._ping_fast_flood_wall_seconds(count)
                     cmd = template % (
                         wall, count, PING_FAST_INTERVAL_SEC, dest_ip)
                 else:
@@ -469,7 +478,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     'timeout %d sudo -n ping -c %d -I %s -i %g -W 2 %s',
                     'ping -c %d -I %s -i %g -W 2 %s'):
                 if 'sudo' in template:
-                    wall = max(30, int(count * PING_FAST_INTERVAL_SEC) + 15)
+                    wall = self._ping_fast_flood_wall_seconds(count)
                     cmd = template % (
                         wall, count, bind_ip, PING_FAST_INTERVAL_SEC, dest_ip)
                 else:
