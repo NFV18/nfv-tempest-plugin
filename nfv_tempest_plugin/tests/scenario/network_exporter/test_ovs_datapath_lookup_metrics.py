@@ -138,26 +138,23 @@ class TestOvsDatapathLookupMetrics(metrics_base.NetworkExporterMetricsBase):
         return shared[0]['ip_address']
 
     def _baseline_lookup_counters(self, hypervisor_ip):
-        datapath = self._configured_datapath_name()
         return {
             'hits': self._datapath_metric_value(
                 hypervisor_ip,
-                metrics_base.OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC,
-                datapath) or 0,
+                metrics_base.OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC) or 0,
             'missed': self._datapath_metric_value(
                 hypervisor_ip,
-                metrics_base.OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC,
-                datapath) or 0,
+                metrics_base.OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC) or 0,
             'lost': self._datapath_metric_value(
                 hypervisor_ip,
-                metrics_base.OVS_DATAPATH_LOOKUP_LOST_TOTAL_METRIC,
-                datapath) or 0,
+                metrics_base.OVS_DATAPATH_LOOKUP_LOST_TOTAL_METRIC) or 0,
         }
 
     def _wait_for_datapath_lookup_counters(self, hypervisor_ip, baseline):
         min_hits = (
             CONF.nfv_plugin_options.network_exporter_datapath_lookup_min_hits)
-        datapath = self._configured_datapath_name()
+        labels = self._resolve_datapath_labels(
+            hypervisor_ip, metrics_base.OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC)
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
@@ -166,7 +163,7 @@ class TestOvsDatapathLookupMetrics(metrics_base.NetworkExporterMetricsBase):
                 key: current[key] - baseline[key]
                 for key in ('hits', 'missed', 'lost')}
             last = {
-                'datapath': datapath,
+                'datapath': '%s@%s' % (labels.get('type'), labels['name']),
                 'baseline': baseline,
                 'current': current,
                 'delta': delta,
@@ -191,7 +188,7 @@ class TestOvsDatapathLookupMetrics(metrics_base.NetworkExporterMetricsBase):
                         metrics_base.OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC,
                         metrics_base.OVS_DATAPATH_LOOKUP_LOST_TOTAL_METRIC):
                     self._assert_datapath_matches_dpctl(
-                        hypervisor_ip, metric_name, datapath)
+                        hypervisor_ip, metric_name)
                 LOG.warning(
                     'Datapath lookup counters increased (attempt %s): %s',
                     attempt + 1, last)
@@ -236,13 +233,15 @@ class TestOvsDatapathLookupMetrics(metrics_base.NetworkExporterMetricsBase):
         sender, receiver = servers[0], servers[1]
         hypervisor_ip = sender['hypervisor_ip']
         peer_ip = self._dataplane_peer_ip(sender, receiver)
-        datapath = self._configured_datapath_name()
+        labels = self._resolve_datapath_labels(
+            hypervisor_ip, metrics_base.OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC)
         baseline = self._baseline_lookup_counters(hypervisor_ip)
         LOG.warning(
-            'Datapath lookup test: %s -> %s on %s datapath %s, baseline %s, '
+            'Datapath lookup test: %s -> %s on %s datapath %s@%s, baseline %s, '
             'ping count %s',
             sender.get('name', sender['id']), peer_ip, hypervisor_ip,
-            datapath, baseline, self._traffic_ping_count())
+            labels.get('type'), labels['name'], baseline,
+            self._traffic_ping_count())
 
         ssh_sender = self.get_remote_client(
             sender['fip'], self.instance_user, key_pair['private_key'])

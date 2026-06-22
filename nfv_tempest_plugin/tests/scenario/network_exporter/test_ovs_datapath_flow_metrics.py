@@ -140,7 +140,9 @@ class TestOvsDatapathFlowMetrics(metrics_base.NetworkExporterMetricsBase):
     def _wait_for_datapath_flow_increase(self, hypervisor_ip, baseline_flows):
         min_inc = (
             CONF.nfv_plugin_options.network_exporter_datapath_min_flow_increase)
-        datapath = self._configured_datapath_name()
+        labels = self._resolve_datapath_labels(
+            hypervisor_ip, metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
+        datapath = labels['name']
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
@@ -150,7 +152,7 @@ class TestOvsDatapathFlowMetrics(metrics_base.NetworkExporterMetricsBase):
             baseline = baseline_flows.get(datapath, 0)
             delta = current - baseline
             last = {
-                'datapath': datapath,
+                'datapath': '%s@%s' % (labels.get('type'), datapath),
                 'baseline': baseline,
                 'current': current,
                 'delta': delta,
@@ -161,8 +163,7 @@ class TestOvsDatapathFlowMetrics(metrics_base.NetworkExporterMetricsBase):
                     'ovs_datapath_flows_total delta %s' % last)
                 self._assert_datapath_matches_dpctl(
                     hypervisor_ip,
-                    metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC,
-                    datapath)
+                    metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
                 LOG.warning(
                     'Datapath flows increased (attempt %s): %s',
                     attempt + 1, last)
@@ -197,14 +198,15 @@ class TestOvsDatapathFlowMetrics(metrics_base.NetworkExporterMetricsBase):
         sender, receiver = servers[0], servers[1]
         hypervisor_ip = sender['hypervisor_ip']
         peer_ip = self._dataplane_peer_ip(sender, receiver)
-        datapath = self._configured_datapath_name()
+        labels = self._resolve_datapath_labels(
+            hypervisor_ip, metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
 
         baseline_flows = self._datapath_sample_map(
             hypervisor_ip, metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
         LOG.warning(
-            'Datapath flow test: %s -> %s on %s datapath %s, post-boot flows %s',
+            'Datapath flow test: %s -> %s on %s datapath %s@%s, post-boot flows %s',
             sender.get('name', sender['id']), peer_ip, hypervisor_ip,
-            datapath, baseline_flows)
+            labels.get('type'), labels['name'], baseline_flows)
 
         ssh_sender = self.get_remote_client(
             sender['fip'], self.instance_user, key_pair['private_key'])

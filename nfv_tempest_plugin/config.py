@@ -148,12 +148,13 @@ NfvPluginOptions = [
                     'typically reflects well under half of routed ICMP).'),
     cfg.StrOpt('network_exporter_datapath_name',
                default='ovs-system',
-               help='OVS datapath name label for ovs_datapath_* metrics and '
-                    'ovs-appctl dpctl/show ground-truth checks.'),
+               help='Preferred OVS datapath name label for ovs_datapath_* '
+                    'metrics. Auto-detected from exporter/dpctl/show when absent '
+                    '(e.g. ovs-netdev on DPDK computes).'),
     cfg.StrOpt('network_exporter_datapath_type',
                default='system',
-               help='OVS datapath type label (e.g. system, netdev) for '
-                    'ovs_datapath_* series selection.'),
+               help='Preferred OVS datapath type label (system or netdev). '
+                    'Auto-detected when the configured pair is absent.'),
     cfg.IntOpt('network_exporter_datapath_min_flow_increase',
                default=1,
                help='Minimum ovs_datapath_flows_total increase after VM boot '
