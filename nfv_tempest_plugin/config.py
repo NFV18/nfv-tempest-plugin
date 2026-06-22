@@ -146,6 +146,18 @@ NfvPluginOptions = [
                help='When probes were transmitted, scale the counter '
                     'expectation to this percent of xmit count (metric-storage '
                     'typically reflects well under half of routed ICMP).'),
+    cfg.StrOpt('network_exporter_datapath_name',
+               default='ovs-system',
+               help='OVS kernel datapath name for ovs_datapath_* metrics and '
+                    'ovs-dpctl ground-truth checks.'),
+    cfg.IntOpt('network_exporter_datapath_min_flow_increase',
+               default=1,
+               help='Minimum ovs_datapath_flows_total increase after VM boot '
+                    'and dataplane traffic.'),
+    cfg.IntOpt('network_exporter_datapath_lookup_min_hits',
+               default=1000,
+               help='Minimum ovs_datapath_lookup_hits_total increase after '
+                    'sustained VM ICMP traffic.'),
     cfg.IntOpt('network_exporter_error_udp_flood_packets',
                default=50000,
                help='UDP datagrams sent at high rate to a peer dataplane IP '

@@ -91,6 +91,9 @@ test-networks:
 # (default 50%%) and network_exporter_router_traffic_min_packets (default 400).
 # Counter expectation also scales to network_exporter_router_traffic_metric_scale_pct
 # (default 28%%) of transmitted probes.
+# network_exporter_datapath_flow and network_exporter_datapath_lookup use the same
+# network layout as network_exporter_generic_traffic (mgmt + normal dataplane).
+# Guests need passwordless sudo for full ICMP flood (network_exporter_traffic_ping_count).
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor
@@ -99,6 +102,10 @@ tests-setup:
   - name: network_exporter_ovs_interface_errors
     flavor: nfv_qe_base_flavor
   - name: network_exporter_router_traffic
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_datapath_flow
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_datapath_lookup
     flavor: nfv_qe_base_flavor
 
 # Flavors used by the test.

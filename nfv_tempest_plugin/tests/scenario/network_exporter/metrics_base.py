@@ -71,6 +71,16 @@ OVS_INTERFACE_ERROR_STAT_TO_METRIC = {
 }
 OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC = 'ovnc_router_port_traffic_pkts'
 OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC = 'ovnc_router_port_traffic_bytes'
+OVS_DATAPATH_FLOWS_TOTAL_METRIC = 'ovs_datapath_flows_total'
+OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC = 'ovs_datapath_lookup_hits_total'
+OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC = 'ovs_datapath_lookup_missed_total'
+OVS_DATAPATH_LOOKUP_LOST_TOTAL_METRIC = 'ovs_datapath_lookup_lost_total'
+OVS_DATAPATH_METRIC_TO_DPCTL_KEY = {
+    OVS_DATAPATH_FLOWS_TOTAL_METRIC: 'flows',
+    OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC: 'hit',
+    OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC: 'missed',
+    OVS_DATAPATH_LOOKUP_LOST_TOTAL_METRIC: 'lost',
+}
 NET_VF_INFO_METRIC = 'net_vf_info'
 NET_VF_RECEIVE_PACKETS_METRIC = 'net_vf_receive_packets_total'
 NET_VF_TRANSMIT_PACKETS_METRIC = 'net_vf_transmit_packets_total'
@@ -128,6 +138,9 @@ OVS_STATE_UP = 1
 OVS_STATE_DOWN = 0
 NETWORK_EXPORTER_INSTANCE_PORT = ':9105'
 FLOW_COUNT_RE = re.compile(r'flow_count=(\d+)', re.IGNORECASE)
+DPCTL_LOOKUPS_RE = re.compile(
+    r'lookups:\s*hit:(\d+)\s+missed:(\d+)\s+lost:(\d+)', re.IGNORECASE)
+DPCTL_FLOWS_RE = re.compile(r'^\s*flows:\s*(\d+)\s*$', re.MULTILINE)
 METRIC_ROW_VALUE_RE = re.compile(r'(\d+)\s*\|?\s*$')
 COMPUTE_METRICS_HOST_RE = re.compile(
     r'(\d+\.\d+\.\d+\.\d+)' + re.escape(NETWORK_EXPORTER_INSTANCE_PORT))
@@ -715,6 +728,114 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             self._router_port_label_key(sample['labels']): sample['value']
             for sample in self._router_port_samples(hypervisor_ip, metric_name)
         }
+
+    def _configured_datapath_name(self):
+        return CONF.nfv_plugin_options.network_exporter_datapath_name
+
+    def _datapath_label_key(self, labels):
+        """Stable identity for ovs_datapath_* series."""
+        return labels.get('datapath')
+
+    def _ovs_datapath_dpctl_stats(self, hypervisor_ip, datapath=None):
+        """Parse ovs-dpctl show -s for flows and lookup counters."""
+        datapath = datapath or self._configured_datapath_name()
+        cmd = 'sudo ovs-dpctl show -s 2>/dev/null'
+        output = self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
+        blocks = re.split(r'\n(?=\S)', output)
+        for block in blocks:
+            header = block.splitlines()[0] if block else ''
+            if datapath not in header:
+                continue
+            lookups = DPCTL_LOOKUPS_RE.search(block)
+            flows = DPCTL_FLOWS_RE.search(block)
+            if not lookups or not flows:
+                self.fail(
+                    'Could not parse ovs-dpctl stats for datapath %s on %s: %r'
+                    % (datapath, hypervisor_ip, block[:500]))
+            return {
+                'flows': int(flows.group(1)),
+                'hit': int(lookups.group(1)),
+                'missed': int(lookups.group(2)),
+                'lost': int(lookups.group(3)),
+            }
+        self.fail(
+            'Datapath %s not found in ovs-dpctl show on %s' % (
+                datapath, hypervisor_ip))
+
+    def _datapath_samples(self, hypervisor_ip, metric_name, datapath=None):
+        """Return datapath samples from metric-storage for one hypervisor."""
+        datapath = datapath or self._configured_datapath_name()
+        samples, error = self._metric_storage_samples(
+            metric_name, hypervisor_ip=hypervisor_ip,
+            required_labels={'datapath': datapath})
+        if samples:
+            return samples
+        LOG.warning(
+            'No %s samples in metric-storage for datapath %s on %s (%s); '
+            'trying live :9105 scrape',
+            metric_name, datapath, hypervisor_ip, error)
+        labels = {'datapath': datapath}
+        prom = self._prom_compute_metric_value(
+            hypervisor_ip, metric_name, labels)
+        if prom is not None:
+            return [{'labels': labels, 'value': prom}]
+        return self._parse_prom_samples(
+            self._scrape_compute_metrics_text(hypervisor_ip), metric_name,
+            required_labels=labels)
+
+    def _datapath_sample_map(self, hypervisor_ip, metric_name, datapath=None):
+        """Map datapath label -> value from metric-storage Prometheus."""
+        return {
+            self._datapath_label_key(sample['labels']): sample['value']
+            for sample in self._datapath_samples(
+                hypervisor_ip, metric_name, datapath=datapath)
+        }
+
+    def _datapath_metric_value(self, hypervisor_ip, metric_name, datapath=None):
+        """Return a single datapath series value for hypervisor_ip."""
+        sample_map = self._datapath_sample_map(
+            hypervisor_ip, metric_name, datapath=datapath)
+        datapath = datapath or self._configured_datapath_name()
+        if datapath in sample_map:
+            return sample_map[datapath]
+        if len(sample_map) == 1:
+            return next(iter(sample_map.values()))
+        return None
+
+    def _assert_datapath_metric_reported(self, metric_name):
+        """Assert ovs_datapath_* via metric show, :9105, and metric-storage."""
+        self._assert_ovs_interface_metric_reported(metric_name)
+        datapath = self._configured_datapath_name()
+        hypervisors = self._get_ssh_hypervisors('')
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisors available for datapath metric %s' %
+            metric_name)
+        hypervisor_ip = hypervisors[0]
+        self._assert_datapath_matches_dpctl(
+            hypervisor_ip, metric_name, datapath)
+
+    def _assert_datapath_matches_dpctl(self, hypervisor_ip, metric_name,
+                                       datapath=None):
+        """Assert exporter datapath metric matches ovs-dpctl on the hypervisor."""
+        datapath = datapath or self._configured_datapath_name()
+        dpctl_key = OVS_DATAPATH_METRIC_TO_DPCTL_KEY.get(metric_name)
+        self.assertIsNotNone(
+            dpctl_key,
+            'No dpctl mapping for datapath metric %s' % metric_name)
+        dpctl_stats = self._ovs_datapath_dpctl_stats(hypervisor_ip, datapath)
+        expected = dpctl_stats[dpctl_key]
+        reported = self._datapath_metric_value(
+            hypervisor_ip, metric_name, datapath=datapath)
+        self.assertIsNotNone(
+            reported,
+            '%s missing for datapath %s on %s' % (
+                metric_name, datapath, hypervisor_ip))
+        self.assertEqual(
+            expected, reported,
+            '%s on %s datapath %s: dpctl %s=%s exporter=%s' % (
+                metric_name, hypervisor_ip, datapath, dpctl_key, expected,
+                reported))
 
     def _assert_metric_on_compute_scrape(self, metric_name):
         """Verify metric_name is exported on at least one compute :9105 scrape."""
