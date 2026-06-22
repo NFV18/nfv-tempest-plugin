@@ -86,6 +86,8 @@ test-networks:
 # network_exporter_router_traffic needs mgmt plus at least one other normal
 # test-network with a distinct CIDR; both subnets are attached to the Neutron
 # router (test_networks_only). Cross-subnet ICMP drives ovnc_router_port_traffic_*.
+# Router counter deltas use network_exporter_router_traffic_packet_tolerance_pct
+# (default 50%%) because metric-storage reflects fewer packets than ICMP sent.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor

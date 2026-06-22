@@ -95,7 +95,8 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
     def _min_expected_packets(self):
         count = self._traffic_ping_count()
         tolerance = (
-            CONF.nfv_plugin_options.network_exporter_traffic_packet_tolerance_pct)
+            CONF.nfv_plugin_options.
+            network_exporter_router_traffic_packet_tolerance_pct)
         return int(count * (100 - tolerance) / 100)
 
     def _min_expected_bytes(self):
@@ -214,29 +215,16 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def _send_router_cross_subnet_traffic(self, ssh_sender, bind_ip, peer_ip,
                                           packet_count, min_packets):
-        """Generate L3 traffic through the Neutron router.
-
-        ovnc_router_port_traffic_* tracks ICMP-sized L3 packets on logical
-        router ports; bound ICMP is the primary generator. UDP is a fallback
-        when ICMP cannot be sent at the required rate.
-        """
-        LOG.warning(
-            'Sending %d bound ICMP echo requests from %s to %s',
-            packet_count, bind_ip, peer_ip)
-        try:
-            self._send_ping_packets_bound(
+        """Generate L3 ICMP through the Neutron router for port counter tests."""
+        if self._guest_has_passwordless_sudo(ssh_sender):
+            self._send_bound_ping_flood_on_guest(
                 ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
             return
-        except AssertionError as exc:
-            LOG.warning(
-                'Bound ICMP flood from %s to %s failed (%s); '
-                'falling back to bound UDP',
-                bind_ip, peer_ip, exc)
         LOG.warning(
-            'Sending %d bound UDP datagrams from %s to %s',
-            packet_count, bind_ip, peer_ip)
-        self._flood_udp_dataplane(
-            ssh_sender, bind_ip, peer_ip, packet_count)
+            'No passwordless sudo; sending slow bound ICMP from %s to %s',
+            bind_ip, peer_ip)
+        self._send_ping_packets_bound(
+            ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
 
     def _sample_map_deltas(self, after, before):
         deltas = {}
@@ -269,9 +257,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def _wait_for_router_traffic_counters(self, hypervisor_ip, baseline_pkts,
                                           baseline_bytes, min_packets=None,
-                                          min_bytes=None, ssh_sender=None,
-                                          bind_ip=None, peer_ip=None,
-                                          packet_count=None):
+                                          min_bytes=None):
         min_packets = (min_packets if min_packets is not None else
                        self._min_expected_packets())
         min_bytes = (min_bytes if min_bytes is not None else
@@ -279,13 +265,6 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
-            if (attempt > 0 and ssh_sender is not None and bind_ip and
-                    peer_ip and packet_count):
-                LOG.warning(
-                    'Re-sending router traffic (attempt %s/%s)',
-                    attempt + 1, metrics_base.METRIC_RETRY_ATTEMPTS)
-                self._send_router_cross_subnet_traffic(
-                    ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
             pkts_after = self._router_port_sample_map(
                 hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
             bytes_after = self._router_port_sample_map(
@@ -367,9 +346,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
         result = self._wait_for_router_traffic_counters(
             hypervisor_ip, baseline_pkts, baseline_bytes,
-            min_packets=min_packets, min_bytes=min_bytes,
-            ssh_sender=ssh_sender, bind_ip=bind_ip, peer_ip=peer_ip,
-            packet_count=packet_count)
+            min_packets=min_packets, min_bytes=min_bytes)
         LOG.warning(
             'Router port traffic OK: pkts total +%s (peak port %s +%s), '
             'bytes total +%s (peak port %s +%s)',

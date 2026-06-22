@@ -130,6 +130,13 @@ NfvPluginOptions = [
                default=64,
                help='Minimum expected byte delta per counted packet when '
                     'validating tx/rx_bytes increases.'),
+    cfg.IntOpt('network_exporter_router_traffic_packet_tolerance_pct',
+               default=50,
+               help='Allowed shortfall (percent) versus '
+                    'network_exporter_traffic_ping_count when comparing '
+                    'ovnc_router_port_traffic_* deltas. Router port counters '
+                    'fed through metric-storage typically reflect roughly half '
+                    'of the ICMP probes sent cross-subnet.'),
     cfg.IntOpt('network_exporter_error_udp_flood_packets',
                default=50000,
                help='UDP datagrams sent at high rate to a peer dataplane IP '
