@@ -139,13 +139,13 @@ class TestOvsDatapathLookupMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def _baseline_lookup_counters(self, hypervisor_ip):
         return {
-            'hits': self._datapath_metric_value(
+            'hits': self._datapath_live_metric_value(
                 hypervisor_ip,
                 metrics_base.OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC) or 0,
-            'missed': self._datapath_metric_value(
+            'missed': self._datapath_live_metric_value(
                 hypervisor_ip,
                 metrics_base.OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC) or 0,
-            'lost': self._datapath_metric_value(
+            'lost': self._datapath_live_metric_value(
                 hypervisor_ip,
                 metrics_base.OVS_DATAPATH_LOOKUP_LOST_TOTAL_METRIC) or 0,
         }

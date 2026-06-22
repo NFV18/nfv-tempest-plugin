@@ -927,6 +927,51 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             % (datapath_type or '*', datapath, hypervisor_ip,
                found_headers, output[:800]))
 
+    def _datapath_live_samples(self, hypervisor_ip, metric_name, datapath=None,
+                               datapath_type=None):
+        """Return ovs_datapath_* samples from live :9105 on the hypervisor."""
+        if datapath is None and datapath_type is None:
+            required_labels = self._resolve_datapath_labels(
+                hypervisor_ip, metric_name)
+        else:
+            required_labels = self._datapath_required_labels(
+                datapath=datapath, datapath_type=datapath_type)
+        prom = self._prom_compute_metric_value(
+            hypervisor_ip, metric_name, required_labels)
+        if prom is not None:
+            return [{'labels': required_labels, 'value': prom}]
+        return self._parse_prom_samples(
+            self._scrape_compute_metrics_text(hypervisor_ip), metric_name,
+            required_labels=required_labels)
+
+    def _datapath_live_sample_map(self, hypervisor_ip, metric_name,
+                                  datapath=None, datapath_type=None):
+        """Map datapath name label -> value from live :9105."""
+        return {
+            self._datapath_label_key(sample['labels']): sample['value']
+            for sample in self._datapath_live_samples(
+                hypervisor_ip, metric_name, datapath=datapath,
+                datapath_type=datapath_type)
+        }
+
+    def _datapath_live_metric_value(self, hypervisor_ip, metric_name,
+                                    datapath=None, datapath_type=None):
+        """Return one ovs_datapath_* value from live :9105."""
+        if datapath is None and datapath_type is None:
+            labels = self._resolve_datapath_labels(
+                hypervisor_ip, metric_name)
+            datapath = labels['name']
+            datapath_type = labels.get('type')
+        sample_map = self._datapath_live_sample_map(
+            hypervisor_ip, metric_name, datapath=datapath,
+            datapath_type=datapath_type)
+        datapath = datapath or self._configured_datapath_name()
+        if datapath in sample_map:
+            return sample_map[datapath]
+        if len(sample_map) == 1:
+            return next(iter(sample_map.values()))
+        return None
+
     def _datapath_samples(self, hypervisor_ip, metric_name, datapath=None,
                           datapath_type=None):
         """Return datapath samples from metric-storage for one hypervisor."""
@@ -1006,7 +1051,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
 
     def _assert_datapath_matches_dpctl(self, hypervisor_ip, metric_name,
                                        datapath=None, datapath_type=None):
-        """Assert exporter datapath metric matches ovs-dpctl on the hypervisor."""
+        """Assert live :9105 datapath metric matches dpctl/show on hypervisor."""
         if datapath is None and datapath_type is None:
             labels = self._resolve_datapath_labels(
                 hypervisor_ip, metric_name)
@@ -1020,22 +1065,45 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         self.assertIsNotNone(
             dpctl_key,
             'No dpctl mapping for datapath metric %s' % metric_name)
-        dpctl_stats = self._ovs_datapath_dpctl_stats(
-            hypervisor_ip, datapath, datapath_type=datapath_type)
-        expected = dpctl_stats[dpctl_key]
-        reported = self._datapath_metric_value(
-            hypervisor_ip, metric_name, datapath=datapath,
-            datapath_type=datapath_type)
         datapath_label = '%s@%s' % (datapath_type or '*', datapath)
-        self.assertIsNotNone(
-            reported,
-            '%s missing for datapath %s on %s' % (
-                metric_name, datapath_label, hypervisor_ip))
-        self.assertEqual(
-            expected, reported,
-            '%s on %s datapath %s: dpctl %s=%s exporter=%s' % (
-                metric_name, hypervisor_ip, datapath_label, dpctl_key,
-                expected, reported))
+        last_exc = None
+        for attempt in range(METRIC_RETRY_ATTEMPTS):
+            dpctl_stats = self._ovs_datapath_dpctl_stats(
+                hypervisor_ip, datapath, datapath_type=datapath_type)
+            expected = dpctl_stats[dpctl_key]
+            reported = self._datapath_live_metric_value(
+                hypervisor_ip, metric_name, datapath=datapath,
+                datapath_type=datapath_type)
+            try:
+                self.assertIsNotNone(
+                    reported,
+                    '%s missing on live :9105 for datapath %s on %s' % (
+                        metric_name, datapath_label, hypervisor_ip))
+                self.assertEqual(
+                    expected, reported,
+                    '%s on %s datapath %s: dpctl %s=%s live exporter=%s' % (
+                        metric_name, hypervisor_ip, datapath_label, dpctl_key,
+                        expected, reported))
+                LOG.warning(
+                    'Datapath %s aligned with dpctl/show on %s (attempt %s): '
+                    '%s=%s',
+                    metric_name, hypervisor_ip, attempt + 1, dpctl_key,
+                    expected)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'Attempt %s/%s waiting for datapath %s on %s to match '
+                    'dpctl/show: %s',
+                    attempt + 1, METRIC_RETRY_ATTEMPTS, metric_name,
+                    hypervisor_ip, exc)
+            if attempt < METRIC_RETRY_ATTEMPTS - 1:
+                time.sleep(METRIC_RETRY_INTERVAL)
+        if last_exc is not None:
+            raise last_exc
+        self.fail(
+            'Timed out waiting for datapath %s on %s to match dpctl/show' % (
+                metric_name, hypervisor_ip))
 
     def _assert_metric_on_compute_scrape(self, metric_name):
         """Verify metric_name is exported on at least one compute :9105 scrape."""

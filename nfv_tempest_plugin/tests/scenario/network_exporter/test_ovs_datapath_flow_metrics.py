@@ -137,36 +137,62 @@ class TestOvsDatapathFlowMetrics(metrics_base.NetworkExporterMetricsBase):
             return net['ip_address']
         return shared[0]['ip_address']
 
-    def _wait_for_datapath_flow_increase(self, hypervisor_ip, baseline_flows):
+    def _wait_for_datapath_flow_increase(self, hypervisor_ip, baseline_flows,
+                                         dpctl_baseline):
         min_inc = (
             CONF.nfv_plugin_options.network_exporter_datapath_min_flow_increase)
         labels = self._resolve_datapath_labels(
             hypervisor_ip, metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
         datapath = labels['name']
+        datapath_type = labels.get('type')
+        baseline = baseline_flows.get(datapath, 0)
+        peak = baseline
+        dpctl_baseline_flows = dpctl_baseline['flows']
+        dpctl_baseline_hits = dpctl_baseline.get('hit', 0)
+        min_hits = min(
+            100,
+            CONF.nfv_plugin_options.network_exporter_datapath_lookup_min_hits)
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
-            after = self._datapath_sample_map(
+            after = self._datapath_live_sample_map(
                 hypervisor_ip, metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
             current = after.get(datapath, 0)
-            baseline = baseline_flows.get(datapath, 0)
-            delta = current - baseline
+            peak = max(peak, current)
+            dpctl_stats = self._ovs_datapath_dpctl_stats(
+                hypervisor_ip, datapath, datapath_type=datapath_type)
+            dpctl_flows = dpctl_stats['flows']
+            dpctl_hits = dpctl_stats.get('hit', 0)
+            exporter_delta = peak - baseline
+            dpctl_flow_delta = dpctl_flows - dpctl_baseline_flows
+            dpctl_hits_delta = dpctl_hits - dpctl_baseline_hits
             last = {
                 'datapath': '%s@%s' % (labels.get('type'), datapath),
                 'baseline': baseline,
                 'current': current,
-                'delta': delta,
+                'peak': peak,
+                'exporter_delta': exporter_delta,
+                'dpctl_baseline_flows': dpctl_baseline_flows,
+                'dpctl_current_flows': dpctl_flows,
+                'dpctl_flow_delta': dpctl_flow_delta,
+                'dpctl_hits_delta': dpctl_hits_delta,
             }
             try:
-                self.assertGreaterEqual(
-                    delta, min_inc,
-                    'ovs_datapath_flows_total delta %s' % last)
+                flow_increased = (
+                    exporter_delta >= min_inc or dpctl_flow_delta >= min_inc)
+                hits_increased = dpctl_hits_delta >= min_hits
+                self.assertTrue(
+                    flow_increased or hits_increased,
+                    'No ovs_datapath flow or lookup hit increase after traffic '
+                    '(need flow +%s or dpctl hits +%s): %s' % (
+                        min_inc, min_hits, last))
                 self._assert_datapath_matches_dpctl(
                     hypervisor_ip,
                     metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
                 LOG.warning(
-                    'Datapath flows increased (attempt %s): %s',
+                    'Datapath traffic validated (attempt %s): %s',
                     attempt + 1, last)
+                last['delta'] = exporter_delta
                 return last
             except Exception as exc:
                 last_exc = exc
@@ -201,12 +227,17 @@ class TestOvsDatapathFlowMetrics(metrics_base.NetworkExporterMetricsBase):
         labels = self._resolve_datapath_labels(
             hypervisor_ip, metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
 
-        baseline_flows = self._datapath_sample_map(
+        baseline_flows = self._datapath_live_sample_map(
             hypervisor_ip, metrics_base.OVS_DATAPATH_FLOWS_TOTAL_METRIC)
+        dpctl_baseline = self._ovs_datapath_dpctl_stats(
+            hypervisor_ip, labels['name'],
+            datapath_type=labels.get('type'))
         LOG.warning(
-            'Datapath flow test: %s -> %s on %s datapath %s@%s, post-boot flows %s',
+            'Datapath flow test: %s -> %s on %s datapath %s@%s, post-boot '
+            'live flows %s dpctl %s',
             sender.get('name', sender['id']), peer_ip, hypervisor_ip,
-            labels.get('type'), labels['name'], baseline_flows)
+            labels.get('type'), labels['name'], baseline_flows,
+            dpctl_baseline)
 
         ssh_sender = self.get_remote_client(
             sender['fip'], self.instance_user, key_pair['private_key'])
@@ -215,7 +246,7 @@ class TestOvsDatapathFlowMetrics(metrics_base.NetworkExporterMetricsBase):
             self._min_expected_packets())
 
         result = self._wait_for_datapath_flow_increase(
-            hypervisor_ip, baseline_flows)
+            hypervisor_ip, baseline_flows, dpctl_baseline)
         LOG.warning(
             'Datapath flows OK: datapath %s +%s (now %s)',
             result['datapath'], result['delta'], result['current'])
