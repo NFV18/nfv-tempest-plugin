@@ -144,6 +144,9 @@ PING_MAX_WALL_SECONDS = 120
 # Routed fast ping needs interval plus RTT per reply; 30s caps ~3k of 5k probes.
 PING_FAST_FLOOD_PER_PACKET_SEC = 0.01
 PING_FAST_FLOOD_MIN_WALL_SECONDS = 90
+# Tempest SSH exec often returns after ~30s; batch routed floods to stay under it.
+PING_FAST_BATCH_PACKETS = 600
+PING_FAST_BATCH_MAX_WALL_SECONDS = 25
 
 
 class NetworkExporterMetricsBase(base_test.BaseTest):
@@ -396,6 +399,12 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             PING_FAST_FLOOD_MIN_WALL_SECONDS,
             int(count * PING_FAST_FLOOD_PER_PACKET_SEC) + 30)
 
+    def _ping_fast_batch_wall_seconds(self, batch_count):
+        """Per-batch wall clock kept under typical Tempest SSH exec limits."""
+        return min(
+            PING_FAST_BATCH_MAX_WALL_SECONDS,
+            max(20, int(batch_count * PING_FAST_FLOOD_PER_PACKET_SEC) + 15))
+
     def _send_ping_packets(self, ssh_client, dest_ip, count, min_packets):
         """Send ICMP echo requests between guests for traffic counter tests.
 
@@ -472,13 +481,42 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
     def _send_ping_packets_bound(self, ssh_client, bind_ip, dest_ip, count,
                                  min_packets):
         """Send ICMP echo requests bound to a specific source address."""
+        if (count > PING_FAST_BATCH_PACKETS and
+                self._guest_has_passwordless_sudo(ssh_client)):
+            return self._send_ping_packets_bound_batched(
+                ssh_client, bind_ip, dest_ip, count, min_packets)
+        return self._send_ping_packets_bound_once(
+            ssh_client, bind_ip, dest_ip, count, min_packets)
+
+    def _send_ping_packets_bound_batched(self, ssh_client, bind_ip, dest_ip,
+                                         count, min_packets):
+        """Send a large bound ping flood in SSH-friendly batches."""
+        remaining = count
+        last_output = ''
+        batch_num = 0
+        while remaining > 0:
+            batch_num += 1
+            batch = min(PING_FAST_BATCH_PACKETS, remaining)
+            LOG.warning(
+                'Bound ping batch %d: %d packets (%d remaining)',
+                batch_num, batch, remaining - batch)
+            last_output = self._send_ping_packets_bound_once(
+                ssh_client, bind_ip, dest_ip, batch, min_packets=1,
+                fast_wall=self._ping_fast_batch_wall_seconds(batch))
+            remaining -= batch
+        return last_output
+
+    def _send_ping_packets_bound_once(self, ssh_client, bind_ip, dest_ip, count,
+                                      min_packets, fast_wall=None):
+        """Send one bound ping command (single SSH exec)."""
         errors = []
         if self._guest_has_passwordless_sudo(ssh_client):
+            wall = (fast_wall if fast_wall is not None else
+                    self._ping_fast_flood_wall_seconds(count))
             for template in (
                     'timeout %d sudo -n ping -c %d -I %s -i %g -W 2 %s',
                     'ping -c %d -I %s -i %g -W 2 %s'):
                 if 'sudo' in template:
-                    wall = self._ping_fast_flood_wall_seconds(count)
                     cmd = template % (
                         wall, count, bind_ip, PING_FAST_INTERVAL_SEC, dest_ip)
                 else:
