@@ -216,13 +216,9 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
     def _send_router_cross_subnet_traffic(self, ssh_sender, bind_ip, peer_ip,
                                           packet_count, min_packets):
         """Generate L3 ICMP through the Neutron router for port counter tests."""
-        if self._guest_has_passwordless_sudo(ssh_sender):
-            self._send_bound_ping_flood_on_guest(
-                ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
-            return
         LOG.warning(
-            'No passwordless sudo; sending slow bound ICMP from %s to %s',
-            bind_ip, peer_ip)
+            'Sending %d bound ICMP echo requests from %s to %s',
+            packet_count, bind_ip, peer_ip)
         self._send_ping_packets_bound(
             ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
 

@@ -147,8 +147,6 @@ PING_FAST_FLOOD_MIN_WALL_SECONDS = 90
 # Tempest SSH exec often returns after ~30s; batch routed floods to stay under it.
 PING_FAST_BATCH_PACKETS = 600
 PING_FAST_BATCH_MAX_WALL_SECONDS = 25
-GUEST_PING_FLOOD_MARKER = '/tmp/tpst-router-ping.done'
-GUEST_PING_FLOOD_LOG = '/tmp/tpst-router-ping.log'
 
 
 class NetworkExporterMetricsBase(base_test.BaseTest):
@@ -479,62 +477,6 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         if sudo:
             cmd = '%s %s' % (sudo, cmd)
         return ssh_client.exec_command(cmd)
-
-    def _send_bound_ping_flood_on_guest(self, ssh_client, bind_ip, dest_ip,
-                                        count, min_packets):
-        """Run a bound ICMP flood on the guest outside Tempest SSH exec limits."""
-        batch = PING_FAST_BATCH_PACKETS
-        marker = GUEST_PING_FLOOD_MARKER
-        script = (
-            'import subprocess\n'
-            'bind = %r\n'
-            'dest = %r\n'
-            'total = %d\n'
-            'batch = %d\n'
-            'interval = %g\n'
-            'marker = %r\n'
-            'sent = 0\n'
-            'while sent < total:\n'
-            '    n = min(batch, total - sent)\n'
-            '    cmd = ["ping", "-c", str(n), "-I", bind, "-i", str(interval),\n'
-            '           "-W", "2", dest]\n'
-            '    proc = subprocess.run(cmd, capture_output=True, text=True)\n'
-            '    out = (proc.stdout or "") + (proc.stderr or "")\n'
-            '    if proc.returncode != 0 or "100%% packet loss" in out:\n'
-            '        break\n'
-            '    sent += n\n'
-            'open(marker, "w").write(str(sent))\n'
-            % (bind_ip, dest_ip, count, batch, PING_FAST_INTERVAL_SEC,
-               marker))
-        encoded = base64.b64encode(script.encode('utf-8')).decode('ascii')
-        sudo = self._guest_sudo_prefix(ssh_client)
-        prefix = '%s ' % sudo if sudo else ''
-        start_cmd = (
-            "rm -f %s; nohup sh -c '%secho %s | base64 -d | python3' "
-            ">>%s 2>&1 &" % (marker, prefix, encoded, GUEST_PING_FLOOD_LOG))
-        LOG.warning(
-            'Starting guest background bound ping flood %s -> %s count %d',
-            bind_ip, dest_ip, count)
-        ssh_client.exec_command(start_cmd)
-        wall = max(180, int(count * PING_FAST_FLOOD_PER_PACKET_SEC) + 120)
-        deadline = time.time() + wall
-        while time.time() < deadline:
-            out = (ssh_client.exec_command(
-                'cat %s 2>/dev/null || true' % marker) or '').strip()
-            if out.isdigit():
-                sent = int(out)
-                LOG.warning(
-                    'Guest bound ping flood finished: %d/%d transmitted',
-                    sent, count)
-                if sent < min(min_packets, count):
-                    self.fail(
-                        'Guest bound ping flood sent %d packets (need >= %d)' %
-                        (sent, min_packets))
-                return sent
-            time.sleep(5)
-        self.fail(
-            'Timed out waiting for guest bound ping flood marker %s '
-            '(limit %ds)' % (marker, wall))
 
     def _send_ping_packets_bound(self, ssh_client, bind_ip, dest_ip, count,
                                  min_packets):
