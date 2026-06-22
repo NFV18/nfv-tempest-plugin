@@ -125,10 +125,11 @@ OVN_CONTROLLER_METRICS_CONTAINER = 'ovn-controller-metrics'
 OVN_CONTROLLER_METRICS_CURL = (
     'curl -sk https://127.0.0.1:1981/metrics 2>/dev/null || '
     'curl -s http://127.0.0.1:1981/metrics 2>/dev/null')
+PROM_NUMBER_RE = r'-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?'
 PROM_METRIC_LINE_RE = re.compile(
     r'^(?P<metric>[a-zA-Z_:][a-zA-Z0-9_:]*)'
     r'\{(?P<labels>[^}]*)\}\s+'
-    r'(?P<value>-?\d+(?:\.\d+)?)$')
+    r'(?P<value>' + PROM_NUMBER_RE + r')$')
 PROM_LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 # openstack-network-exporter: 0=standby, 1=active, 2=paused
 OVN_NORTHD_STATUS_VALUES = (0, 1, 2)
@@ -171,6 +172,11 @@ PING_FAST_BATCH_MAX_WALL_SECONDS = 25
 
 class NetworkExporterMetricsBase(base_test.BaseTest):
     """Shared helpers for openstack-network-exporter Tempest tests."""
+
+    @staticmethod
+    def _parse_prom_number(value_str):
+        """Parse a Prometheus numeric sample (supports scientific notation)."""
+        return int(float(value_str))
 
     def __init__(self, *args, **kwargs):
         super(NetworkExporterMetricsBase, self).__init__(*args, **kwargs)
@@ -1441,26 +1447,25 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
 
     def _prom_compute_metric_value(self, hypervisor_ip, metric_name, labels):
         """Read one gauge from the local :9105 scrape matching Prometheus labels."""
+        value_pattern = re.compile(
+            r'%s\{[^}]*\}\s+(%s)\s*$' % (
+                re.escape(metric_name), PROM_NUMBER_RE))
         grep = "grep '^%s{'" % metric_name
         for key in sorted(labels):
             grep += " | grep '%s=\"%s\"'" % (key, labels[key])
-        cmd = (
-            "curl -sk https://127.0.0.1:9105/metrics 2>/dev/null | %s" % grep)
-        out = self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
-        pattern = re.compile(
-            r'%s\{[^}]*\}\s+(-?\d+(?:\.\d+)?)' % re.escape(metric_name))
-        for line in out.splitlines():
-            match = pattern.search(line)
-            if match:
-                return int(float(match.group(1)))
-        cmd_http = (
-            "curl -s http://127.0.0.1:9105/metrics 2>/dev/null | %s" % grep)
-        out = self._ssh_run_on_hypervisor(hypervisor_ip, cmd_http)
-        for line in out.splitlines():
-            match = pattern.search(line)
-            if match:
-                return int(float(match.group(1)))
-        return None
+        for cmd in (
+                "curl -sk https://127.0.0.1:9105/metrics 2>/dev/null | %s"
+                % grep,
+                "curl -s http://127.0.0.1:9105/metrics 2>/dev/null | %s"
+                % grep):
+            out = self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
+            for line in out.splitlines():
+                match = value_pattern.search(line.strip())
+                if match:
+                    return self._parse_prom_number(match.group(1))
+        return self._parse_prom_metric_text(
+            self._scrape_compute_metrics_text(hypervisor_ip),
+            metric_name, labels)
 
     def _parse_prom_metric_text(self, metrics_output, metric_name, labels):
         """Parse a gauge from Prometheus exposition text."""
@@ -1473,7 +1478,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             parts = line.rsplit(None, 1)
             if len(parts) == 2:
                 try:
-                    return int(float(parts[1]))
+                    return self._parse_prom_number(parts[1])
                 except ValueError:
                     continue
         return None
@@ -1766,6 +1771,6 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 continue
             samples.append({
                 'labels': labels,
-                'value': int(float(match.group('value'))),
+                'value': self._parse_prom_number(match.group('value')),
             })
         return samples
