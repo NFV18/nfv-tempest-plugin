@@ -478,22 +478,51 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             cmd = '%s %s' % (sudo, cmd)
         return ssh_client.exec_command(cmd)
 
+    def _parse_ping_transmitted(self, output):
+        """Return ICMP probes transmitted per ping(8) statistics output."""
+        match = re.search(r'(\d+) packets transmitted', output or '')
+        return int(match.group(1)) if match else 0
+
+    def _bound_ping_cmd_output(self, ssh_client, cmd, accept_xmit_only=False):
+        """Run a bound ping command; optionally ignore non-zero ping exit status."""
+        run = '%s || true' % cmd if accept_xmit_only else cmd
+        try:
+            return ssh_client.exec_command(run) or ''
+        except Exception as exc:
+            if accept_xmit_only:
+                return str(exc)
+            raise
+
+    def _bound_ping_output_ok(self, output, min_packets,
+                              accept_xmit_only=False):
+        transmitted = self._parse_ping_transmitted(output)
+        if accept_xmit_only:
+            return transmitted >= min_packets, transmitted
+        if '100% packet loss' not in (output or ''):
+            return True, transmitted
+        return False, transmitted
+
     def _send_ping_packets_bound(self, ssh_client, bind_ip, dest_ip, count,
-                                 min_packets):
+                                 min_packets, accept_xmit_only=False):
         """Send ICMP echo requests bound to a specific source address."""
         if (count > PING_FAST_BATCH_PACKETS and
                 self._guest_has_passwordless_sudo(ssh_client)):
             return self._send_ping_packets_bound_batched(
-                ssh_client, bind_ip, dest_ip, count, min_packets)
+                ssh_client, bind_ip, dest_ip, count, min_packets,
+                accept_xmit_only=accept_xmit_only)
         return self._send_ping_packets_bound_once(
-            ssh_client, bind_ip, dest_ip, count, min_packets)
+            ssh_client, bind_ip, dest_ip, count, min_packets,
+            accept_xmit_only=accept_xmit_only)
 
     def _send_ping_packets_bound_batched(self, ssh_client, bind_ip, dest_ip,
-                                         count, min_packets):
+                                         count, min_packets,
+                                         accept_xmit_only=False):
         """Send a large bound ping flood in SSH-friendly batches."""
         remaining = count
         last_output = ''
+        total_xmit = 0
         batch_num = 0
+        batch_min = 1 if accept_xmit_only else min_packets
         while remaining > 0:
             batch_num += 1
             batch = min(PING_FAST_BATCH_PACKETS, remaining)
@@ -501,13 +530,20 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 'Bound ping batch %d: %d packets (%d remaining)',
                 batch_num, batch, remaining - batch)
             last_output = self._send_ping_packets_bound_once(
-                ssh_client, bind_ip, dest_ip, batch, min_packets=1,
-                fast_wall=self._ping_fast_batch_wall_seconds(batch))
+                ssh_client, bind_ip, dest_ip, batch, min_packets=batch_min,
+                fast_wall=self._ping_fast_batch_wall_seconds(batch),
+                accept_xmit_only=accept_xmit_only)
+            total_xmit += self._parse_ping_transmitted(last_output)
             remaining -= batch
+        if accept_xmit_only:
+            LOG.warning(
+                'Bound ping xmit-only flood: %d/%d transmitted %s -> %s',
+                total_xmit, count, bind_ip, dest_ip)
         return last_output
 
     def _send_ping_packets_bound_once(self, ssh_client, bind_ip, dest_ip, count,
-                                      min_packets, fast_wall=None):
+                                      min_packets, fast_wall=None,
+                                      accept_xmit_only=False):
         """Send one bound ping command (single SSH exec)."""
         errors = []
         if self._guest_has_passwordless_sudo(ssh_client):
@@ -524,16 +560,25 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                         count, bind_ip, PING_FAST_INTERVAL_SEC, dest_ip)
                 LOG.warning('Sending bound ping: %s', cmd)
                 try:
-                    output = ssh_client.exec_command(cmd)
+                    output = self._bound_ping_cmd_output(
+                        ssh_client, cmd, accept_xmit_only=accept_xmit_only)
                 except Exception as exc:
                     errors.append('%s -> %s' % (cmd, exc))
                     continue
-                if '100% packet loss' not in (output or ''):
+                ok, transmitted = self._bound_ping_output_ok(
+                    output, min_packets, accept_xmit_only=accept_xmit_only)
+                if ok:
+                    if accept_xmit_only:
+                        LOG.warning(
+                            'Bound ping xmit-only OK: %d transmitted %s -> %s',
+                            transmitted, bind_ip, dest_ip)
                     return output
-                errors.append('%s -> 100%% packet loss' % cmd)
+                errors.append(
+                    '%s -> xmit %d (need >= %d)' % (cmd, transmitted,
+                                                    min_packets))
         capped = min(count, int(PING_MAX_WALL_SECONDS /
                                  PING_SLOW_INTERVAL_SEC))
-        if capped < min_packets:
+        if capped < min_packets and not accept_xmit_only:
             LOG.warning(
                 'Bound ping capped at %d without passwordless sudo '
                 '(requested min %d); using capped count at %gs interval',
@@ -544,13 +589,18 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             wall, capped, bind_ip, PING_SLOW_INTERVAL_SEC, dest_ip)
         LOG.warning('Sending bound ping (slow path): %s', cmd)
         try:
-            output = ssh_client.exec_command(cmd)
+            output = self._bound_ping_cmd_output(
+                ssh_client, cmd, accept_xmit_only=accept_xmit_only)
         except Exception as exc:
             errors.append('%s -> %s' % (cmd, exc))
         else:
-            if '100% packet loss' not in (output or ''):
+            ok, transmitted = self._bound_ping_output_ok(
+                output, min_packets, accept_xmit_only=accept_xmit_only)
+            if ok:
                 return output
-            errors.append('%s -> 100%% packet loss' % cmd)
+            errors.append(
+                '%s -> xmit %d (need >= %d)' % (cmd, transmitted,
+                                                min_packets))
         detail = '; '.join(errors) if errors else 'bound ping failed'
         self.fail('Ping from %s to %s failed: %s' % (bind_ip, dest_ip, detail))
 

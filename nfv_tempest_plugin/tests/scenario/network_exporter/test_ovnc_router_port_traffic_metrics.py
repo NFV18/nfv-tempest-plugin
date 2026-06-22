@@ -213,14 +213,43 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
             bind_ip, peer_ip)
         return bind_ip, peer_ip
 
-    def _send_router_cross_subnet_traffic(self, ssh_sender, bind_ip, peer_ip,
-                                          packet_count, min_packets):
-        """Generate L3 ICMP through the Neutron router for port counter tests."""
-        LOG.warning(
-            'Sending %d bound ICMP echo requests from %s to %s',
-            packet_count, bind_ip, peer_ip)
-        self._send_ping_packets_bound(
-            ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
+    def _send_router_cross_subnet_traffic(self, ssh_sender, sender, receiver,
+                                          packet_count, min_packets,
+                                          preferred_pair=None):
+        """Generate L3 ICMP through the Neutron router for port counter tests.
+
+        Router port counters reflect forwarded probes; ICMP replies are not
+        required. Try each cross-subnet bind/peer pair until one transmits.
+        """
+        candidates = self._cross_subnet_peer_candidates(sender, receiver)
+        if preferred_pair and preferred_pair in candidates:
+            candidates.remove(preferred_pair)
+            candidates.insert(0, preferred_pair)
+        elif preferred_pair:
+            candidates.insert(0, preferred_pair)
+        if not candidates:
+            self.fail(
+                'Could not find cross-subnet IPs between VMs %s and %s' % (
+                    sender.get('name', sender['id']),
+                    receiver.get('name', receiver['id'])))
+        last_err = None
+        for bind_ip, peer_ip in candidates:
+            LOG.warning(
+                'Sending %d bound ICMP (xmit-only) from %s to %s',
+                packet_count, bind_ip, peer_ip)
+            try:
+                self._send_ping_packets_bound(
+                    ssh_sender, bind_ip, peer_ip, packet_count,
+                    min_packets=1, accept_xmit_only=True)
+                return bind_ip, peer_ip
+            except AssertionError as exc:
+                last_err = exc
+                LOG.warning(
+                    'Cross-subnet xmit failed for %s -> %s: %s',
+                    bind_ip, peer_ip, exc)
+        self.fail(
+            'No cross-subnet pair transmitted ICMP for router traffic test: '
+            '%s' % last_err)
 
     def _sample_map_deltas(self, after, before):
         deltas = {}
@@ -337,8 +366,9 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         baseline_bytes = self._router_port_sample_map(
             hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
-        self._send_router_cross_subnet_traffic(
-            ssh_sender, bind_ip, peer_ip, packet_count, min_packets)
+        bind_ip, peer_ip = self._send_router_cross_subnet_traffic(
+            ssh_sender, sender, receiver, packet_count, min_packets,
+            preferred_pair=(bind_ip, peer_ip))
 
         result = self._wait_for_router_traffic_counters(
             hypervisor_ip, baseline_pkts, baseline_bytes,
