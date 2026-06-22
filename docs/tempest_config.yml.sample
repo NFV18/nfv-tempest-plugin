@@ -89,7 +89,8 @@ test-networks:
 # sec_groups: true is applied on every normal/mgmt router test-network automatically.
 # Router counter deltas use network_exporter_router_traffic_packet_tolerance_pct
 # (default 50%%) and network_exporter_router_traffic_min_packets (default 400).
-# Traffic is only sent on ICMP probe-verified cross-subnet pairs.
+# Counter expectation also scales to network_exporter_router_traffic_metric_scale_pct
+# (default 28%%) of transmitted probes.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor

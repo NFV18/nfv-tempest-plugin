@@ -105,7 +105,10 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         configured = int(count * (100 - tolerance) / 100)
         floor = CONF.nfv_plugin_options.network_exporter_router_traffic_min_packets
         if transmitted:
-            scaled = max(floor, int(transmitted * 0.35))
+            scale_pct = (
+                CONF.nfv_plugin_options.
+                network_exporter_router_traffic_metric_scale_pct)
+            scaled = max(floor, int(transmitted * scale_pct / 100))
             return min(configured, scaled)
         return max(floor, configured)
 
