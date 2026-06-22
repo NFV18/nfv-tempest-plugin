@@ -44,7 +44,12 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         for network in test_networks:
             if network.get('port_type') == 'direct':
                 continue
-            filtered.append(network)
+            net = dict(network)
+            # Attach the ICMP-capable security group to every router-test port,
+            # not only mgmt (dataplane ports otherwise keep the default SG).
+            if net.get('sec_groups') is not False:
+                net['sec_groups'] = True
+            filtered.append(net)
         non_mgmt = [net for net in filtered if not net.get('mgmt')]
         if len(non_mgmt) < 1:
             raise unittest.SkipTest(
@@ -196,70 +201,67 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         scored.sort(key=lambda item: item[0])
         return [(bind_ip, peer_ip) for _, bind_ip, peer_ip in scored]
 
-    def _validated_cross_subnet_pairs(self, ssh_sender, sender, receiver):
-        """Return probe-verified (bind_ip, peer_ip) pairs that use the router."""
-        validated = []
+    def _router_traffic_endpoints(self, ssh_sender, ssh_receiver, sender,
+                                  receiver):
+        """Return ordered (ssh, bind_ip, peer_ip) triples for router traffic."""
+        probed = []
+        fallback = []
+        seen = set()
         for bind_ip, peer_ip in self._cross_subnet_peer_candidates(
                 sender, receiver):
-            LOG.warning(
-                'Probing cross-subnet pair bind %s -> %s', bind_ip, peer_ip)
-            if self._probe_bound_ping(ssh_sender, bind_ip, peer_ip):
+            forward = (bind_ip, peer_ip)
+            reverse = (peer_ip, bind_ip)
+            if forward not in seen:
                 LOG.warning(
-                    'Probe OK for cross-subnet pair bind %s -> %s',
-                    bind_ip, peer_ip)
-                validated.append((bind_ip, peer_ip))
-        return validated
+                    'Probing cross-subnet pair bind %s -> %s', bind_ip, peer_ip)
+                if self._probe_bound_ping(ssh_sender, bind_ip, peer_ip):
+                    LOG.warning('Probe OK (sender) %s -> %s', bind_ip, peer_ip)
+                    probed.append((ssh_sender, bind_ip, peer_ip))
+                    seen.add(forward)
+                    continue
+                if self._probe_bound_ping(ssh_receiver, peer_ip, bind_ip):
+                    LOG.warning(
+                        'Probe OK (receiver) %s -> %s', peer_ip, bind_ip)
+                    probed.append((ssh_receiver, peer_ip, bind_ip))
+                    seen.add(reverse)
+                    continue
+                fallback.append((ssh_sender, bind_ip, peer_ip))
+                seen.add(forward)
+        if probed:
+            return probed + [
+                ep for ep in fallback
+                if (ep[1], ep[2]) not in {(p[1], p[2]) for p in probed}]
+        if fallback:
+            LOG.warning(
+                'No cross-subnet ICMP probe succeeded; using ranked '
+                'candidates (ensure sec_groups on all router test-networks)')
+            return fallback
+        return []
 
-    def _select_cross_subnet_pair(self, ssh_sender, sender, receiver):
-        """Pick a routable cross-subnet IP pair, probing with bound ICMP."""
-        validated = self._validated_cross_subnet_pairs(
-            ssh_sender, sender, receiver)
-        if not validated:
-            self.fail(
-                'No cross-subnet ICMP probe succeeded between VMs %s and %s. '
-                'Ensure mgmt and at least one other routed network, security '
-                'groups allow ICMP, and VMs have ports on both subnets.' % (
-                    sender.get('name', sender['id']),
-                    receiver.get('name', receiver['id'])))
-        bind_ip, peer_ip = validated[0]
-        LOG.warning(
-            'Using routable cross-subnet pair bind %s -> %s',
-            bind_ip, peer_ip)
-        return bind_ip, peer_ip
-
-    def _send_router_cross_subnet_traffic(self, ssh_sender, sender, receiver,
-                                          packet_count, preferred_pair=None):
+    def _send_router_cross_subnet_traffic(self, endpoints, packet_count):
         """Generate L3 ICMP through the Neutron router for port counter tests."""
-        validated = self._validated_cross_subnet_pairs(
-            ssh_sender, sender, receiver)
-        if not validated:
-            self.fail(
-                'No cross-subnet ICMP probe succeeded between VMs %s and %s' % (
-                    sender.get('name', sender['id']),
-                    receiver.get('name', receiver['id'])))
-        if preferred_pair and preferred_pair in validated:
-            validated.remove(preferred_pair)
-            validated.insert(0, preferred_pair)
+        if not endpoints:
+            self.fail('No cross-subnet traffic endpoints between VMs')
         last_err = None
-        for bind_ip, peer_ip in validated:
+        for ssh, bind_ip, peer_ip in endpoints:
             LOG.warning(
                 'Sending %d bound ICMP (xmit-only) from %s to %s',
                 packet_count, bind_ip, peer_ip)
             try:
                 total_xmit = self._send_ping_packets_bound(
-                    ssh_sender, bind_ip, peer_ip, packet_count,
+                    ssh, bind_ip, peer_ip, packet_count,
                     min_packets=1, accept_xmit_only=True)
                 LOG.warning(
-                    'Transmitted %d ICMP probes on verified pair %s -> %s',
+                    'Transmitted %d ICMP probes on pair %s -> %s',
                     total_xmit, bind_ip, peer_ip)
-                return bind_ip, peer_ip, total_xmit
+                return ssh, bind_ip, peer_ip, total_xmit
             except AssertionError as exc:
                 last_err = exc
                 LOG.warning(
                     'Cross-subnet xmit failed for %s -> %s: %s',
                     bind_ip, peer_ip, exc)
         self.fail(
-            'Probe-verified cross-subnet pairs failed to transmit ICMP: %s' %
+            'All cross-subnet traffic endpoints failed to transmit ICMP: %s' %
             last_err)
 
     def _sample_map_deltas(self, after, before):
@@ -293,7 +295,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     def _wait_for_router_traffic_counters(self, hypervisor_ip, baseline_pkts,
                                           baseline_bytes, min_packets=None,
-                                          min_bytes=None, ssh_sender=None,
+                                          min_bytes=None, ssh_traffic=None,
                                           packet_count=None,
                                           traffic_pair=None):
         min_packets = (min_packets if min_packets is not None else
@@ -303,7 +305,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
-            if (attempt > 0 and ssh_sender is not None and traffic_pair and
+            if (attempt > 0 and ssh_traffic is not None and traffic_pair and
                     packet_count):
                 bind_ip, peer_ip = traffic_pair
                 LOG.warning(
@@ -311,7 +313,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
                     attempt + 1, metrics_base.METRIC_RETRY_ATTEMPTS,
                     bind_ip, peer_ip)
                 self._send_ping_packets_bound(
-                    ssh_sender, bind_ip, peer_ip, packet_count,
+                    ssh_traffic, bind_ip, peer_ip, packet_count,
                     min_packets=1, accept_xmit_only=True)
             pkts_after = self._router_port_sample_map(
                 hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
@@ -373,8 +375,15 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         hypervisor_ip = sender['hypervisor_ip']
         ssh_sender = self.get_remote_client(
             sender['fip'], self.instance_user, key_pair['private_key'])
-        bind_ip, peer_ip = self._select_cross_subnet_pair(
-            ssh_sender, sender, receiver)
+        ssh_receiver = self.get_remote_client(
+            receiver['fip'], self.instance_user, key_pair['private_key'])
+        endpoints = self._router_traffic_endpoints(
+            ssh_sender, ssh_receiver, sender, receiver)
+        if not endpoints:
+            self.fail(
+                'No cross-subnet IPs between VMs %s and %s' % (
+                    sender.get('name', sender['id']),
+                    receiver.get('name', receiver['id'])))
         packet_count = self._traffic_ping_count()
 
         baseline_pkts = self._router_port_sample_map(
@@ -382,9 +391,8 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         baseline_bytes = self._router_port_sample_map(
             hypervisor_ip, metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
-        bind_ip, peer_ip, total_xmit = self._send_router_cross_subnet_traffic(
-            ssh_sender, sender, receiver, packet_count,
-            preferred_pair=(bind_ip, peer_ip))
+        ssh_traffic, bind_ip, peer_ip, total_xmit = (
+            self._send_router_cross_subnet_traffic(endpoints, packet_count))
         min_packets = self._min_expected_packets(transmitted=total_xmit)
         min_bytes = self._min_expected_bytes(min_packets)
         LOG.warning(
@@ -396,7 +404,7 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         result = self._wait_for_router_traffic_counters(
             hypervisor_ip, baseline_pkts, baseline_bytes,
             min_packets=min_packets, min_bytes=min_bytes,
-            ssh_sender=ssh_sender, packet_count=packet_count,
+            ssh_traffic=ssh_traffic, packet_count=packet_count,
             traffic_pair=(bind_ip, peer_ip))
         LOG.warning(
             'Router port traffic OK: pkts total +%s (peak port %s +%s), '
