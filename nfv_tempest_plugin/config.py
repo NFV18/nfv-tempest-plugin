@@ -163,6 +163,15 @@ NfvPluginOptions = [
                default=1000,
                help='Minimum ovs_datapath_lookup_hits_total increase after '
                     'sustained VM ICMP traffic.'),
+    cfg.IntOpt('network_exporter_pmd_min_iterations',
+               default=1000,
+               help='Minimum summed ovs_pmd_total/busy_iterations increase '
+                    'after VM ICMP traffic on DPDK computes.'),
+    cfg.IntOpt('network_exporter_pmd_min_packets',
+               default=0,
+               help='Minimum summed ovs_pmd_rx/tx_packets increase after VM '
+                    'traffic. 0 scales from network_exporter_traffic_ping_count '
+                    'and packet tolerance.'),
     cfg.IntOpt('network_exporter_error_udp_flood_packets',
                default=50000,
                help='UDP datagrams sent at high rate to a peer dataplane IP '

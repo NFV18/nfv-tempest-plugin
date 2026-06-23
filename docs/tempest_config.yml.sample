@@ -94,6 +94,8 @@ test-networks:
 # network_exporter_datapath_flow and network_exporter_datapath_lookup use the same
 # network layout as network_exporter_generic_traffic (mgmt + normal dataplane).
 # Guests need passwordless sudo for full ICMP flood (network_exporter_traffic_ping_count).
+# network_exporter_pmd_iterations and network_exporter_pmd_packets require DPDK-enabled
+# computes (pmd-perf-show). Same network layout as network_exporter_generic_traffic.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor
@@ -106,6 +108,10 @@ tests-setup:
   - name: network_exporter_datapath_flow
     flavor: nfv_qe_base_flavor
   - name: network_exporter_datapath_lookup
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_pmd_iterations
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_pmd_packets
     flavor: nfv_qe_base_flavor
 
 # Flavors used by the test.

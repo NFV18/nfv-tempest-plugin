@@ -81,6 +81,27 @@ OVS_DATAPATH_METRIC_TO_DPCTL_KEY = {
     OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC: 'missed',
     OVS_DATAPATH_LOOKUP_LOST_TOTAL_METRIC: 'lost',
 }
+OVS_PMD_TOTAL_ITERATIONS_METRIC = 'ovs_pmd_total_iterations'
+OVS_PMD_IDLE_ITERATIONS_METRIC = 'ovs_pmd_idle_iterations'
+OVS_PMD_BUSY_ITERATIONS_METRIC = 'ovs_pmd_busy_iterations'
+OVS_PMD_RX_PACKETS_METRIC = 'ovs_pmd_rx_packets'
+OVS_PMD_TX_PACKETS_METRIC = 'ovs_pmd_tx_packets'
+OVS_PMD_ITERATION_METRICS = (
+    OVS_PMD_TOTAL_ITERATIONS_METRIC,
+    OVS_PMD_IDLE_ITERATIONS_METRIC,
+    OVS_PMD_BUSY_ITERATIONS_METRIC,
+)
+OVS_PMD_PACKET_METRICS = (
+    OVS_PMD_RX_PACKETS_METRIC,
+    OVS_PMD_TX_PACKETS_METRIC,
+)
+OVS_PMD_METRIC_TO_PERF_STAT = {
+    OVS_PMD_TOTAL_ITERATIONS_METRIC: 'Iterations',
+    OVS_PMD_IDLE_ITERATIONS_METRIC: '- idle iterations',
+    OVS_PMD_BUSY_ITERATIONS_METRIC: '- busy iterations',
+    OVS_PMD_RX_PACKETS_METRIC: 'Rx packets',
+    OVS_PMD_TX_PACKETS_METRIC: 'Tx packets',
+}
 NET_VF_INFO_METRIC = 'net_vf_info'
 NET_VF_RECEIVE_PACKETS_METRIC = 'net_vf_receive_packets_total'
 NET_VF_TRANSMIT_PACKETS_METRIC = 'net_vf_transmit_packets_total'
@@ -148,6 +169,12 @@ DPCTL_SHOW_COMMANDS = (
     'ovs-appctl dpctl/show 2>/dev/null',
     'sudo ovs-dpctl show -s 2>/dev/null',
     'sudo ovs-dpctl show 2>/dev/null',
+)
+PMD_THREAD_RE = re.compile(r'^pmd thread numa_id (\d+) core_id (\d+):$')
+PMD_PERF_STAT_RE = re.compile(r'^\s*([^:]+):\s+(\d+)\s*(.*)$')
+PMD_PERF_SHOW_COMMANDS = (
+    'sudo ovs-appctl dpif-netdev/pmd-perf-show 2>/dev/null',
+    'ovs-appctl dpif-netdev/pmd-perf-show 2>/dev/null',
 )
 METRIC_ROW_VALUE_RE = re.compile(r'(\d+)\s*\|?\s*$')
 COMPUTE_METRICS_HOST_RE = re.compile(
@@ -1110,6 +1137,158 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         self.fail(
             'Timed out waiting for datapath %s on %s to match dpctl/show' % (
                 metric_name, hypervisor_ip))
+
+    def _pmd_perf_show_output(self, hypervisor_ip):
+        """Fetch dpif-netdev/pmd-perf-show (same source as network-exporter)."""
+        last_output = ''
+        for cmd in PMD_PERF_SHOW_COMMANDS:
+            output = self._ssh_run_on_hypervisor(
+                hypervisor_ip, cmd, check_rc=False)
+            if output and output.strip():
+                return output
+            last_output = output or last_output
+        self.fail(
+            'Could not get pmd-perf-show on %s (last output: %r)' % (
+                hypervisor_ip, (last_output or '')[:500]))
+
+    def _ovs_pmd_perf_stats_map(self, hypervisor_ip):
+        """Map (numa, cpu) -> pmd-perf-show stat name -> value."""
+        output = self._pmd_perf_show_output(hypervisor_ip)
+        result = {}
+        numa = cpu = None
+        for line in output.splitlines():
+            thread = PMD_THREAD_RE.match(line)
+            if thread:
+                numa, cpu = thread.group(1), thread.group(2)
+                result[(numa, cpu)] = {}
+                continue
+            if numa is None:
+                continue
+            stat = PMD_PERF_STAT_RE.match(line)
+            if stat:
+                result[(numa, cpu)][stat.group(1).strip()] = int(stat.group(2))
+        return result
+
+    def _pmd_thread_key(self, labels):
+        return labels.get('numa'), labels.get('cpu')
+
+    def _pmd_live_samples(self, hypervisor_ip, metric_name):
+        """Return all ovs_pmd_* samples from live :9105 on one hypervisor."""
+        return self._parse_prom_samples(
+            self._scrape_compute_metrics_text(hypervisor_ip), metric_name)
+
+    def _pmd_live_total(self, hypervisor_ip, metric_name):
+        """Sum ovs_pmd_* across all PMD threads on one hypervisor."""
+        return sum(
+            sample['value']
+            for sample in self._pmd_live_samples(hypervisor_ip, metric_name))
+
+    def _pmd_perf_total(self, hypervisor_ip, metric_name):
+        """Sum one pmd-perf-show stat across all PMD threads."""
+        stat_name = OVS_PMD_METRIC_TO_PERF_STAT.get(metric_name)
+        if not stat_name:
+            return 0
+        return sum(
+            stats.get(stat_name, 0)
+            for stats in self._ovs_pmd_perf_stats_map(hypervisor_ip).values())
+
+    def _hypervisors_with_pmd_perf(self, hypervisors):
+        """Return hypervisors that export pmd-perf-show stats."""
+        found = []
+        for hypervisor_ip in hypervisors:
+            try:
+                if self._ovs_pmd_perf_stats_map(hypervisor_ip):
+                    found.append(hypervisor_ip)
+            except Exception as exc:
+                LOG.warning(
+                    'No pmd-perf-show on %s: %s', hypervisor_ip, exc)
+        return found
+
+    def _assert_pmd_matches_perf_show(self, hypervisor_ip, metric_name):
+        """Assert live :9105 ovs_pmd_* matches pmd-perf-show on hypervisor."""
+        stat_name = OVS_PMD_METRIC_TO_PERF_STAT.get(metric_name)
+        self.assertIsNotNone(
+            stat_name, 'No pmd-perf-show mapping for metric %s' % metric_name)
+        last_exc = None
+        for attempt in range(METRIC_RETRY_ATTEMPTS):
+            perf_map = self._ovs_pmd_perf_stats_map(hypervisor_ip)
+            live_by_key = {
+                self._pmd_thread_key(sample['labels']): sample['value']
+                for sample in self._pmd_live_samples(hypervisor_ip, metric_name)
+            }
+            try:
+                self.assertNotEmpty(
+                    perf_map,
+                    'pmd-perf-show empty on %s' % hypervisor_ip)
+                self.assertNotEmpty(
+                    live_by_key,
+                    '%s missing on live :9105 on %s' % (
+                        metric_name, hypervisor_ip))
+                matched = False
+                for thread_key, stats in perf_map.items():
+                    if stat_name not in stats:
+                        continue
+                    expected = stats[stat_name]
+                    reported = live_by_key.get(thread_key)
+                    if reported is None:
+                        continue
+                    self.assertEqual(
+                        expected, reported,
+                        '%s on %s numa=%s cpu=%s: perf-show %s=%s live=%s' % (
+                            metric_name, hypervisor_ip, thread_key[0],
+                            thread_key[1], stat_name, expected, reported))
+                    matched = True
+                    LOG.warning(
+                        'PMD %s aligned with pmd-perf-show on %s numa=%s '
+                        'cpu=%s (attempt %s): %s',
+                        metric_name, hypervisor_ip, thread_key[0],
+                        thread_key[1], attempt + 1, expected)
+                    return
+                self.fail(
+                    '%s on %s: no pmd-perf-show thread matched live :9105 '
+                    '(perf threads %s, live threads %s)' % (
+                        metric_name, hypervisor_ip,
+                        list(perf_map.keys()), list(live_by_key.keys())))
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'Attempt %s/%s waiting for PMD %s on %s: %s',
+                    attempt + 1, METRIC_RETRY_ATTEMPTS, metric_name,
+                    hypervisor_ip, exc)
+            if attempt < METRIC_RETRY_ATTEMPTS - 1:
+                time.sleep(METRIC_RETRY_INTERVAL)
+        if last_exc is not None:
+            raise last_exc
+        self.fail(
+            'Timed out waiting for PMD %s on %s to match pmd-perf-show' % (
+                metric_name, hypervisor_ip))
+
+    def _assert_pmd_metric_reported(self, metric_name):
+        """Assert ovs_pmd_* via metric show, :9105, and pmd-perf-show."""
+        self._assert_ovs_interface_metric_reported(metric_name)
+        hypervisors = self._get_ssh_hypervisors('')
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisors available for PMD metric %s' % metric_name)
+        pmd_hypervisors = self._hypervisors_with_pmd_perf(hypervisors)
+        self.assertNotEmpty(
+            pmd_hypervisors,
+            'No DPDK pmd-perf-show output on hypervisors %s for %s' % (
+                hypervisors, metric_name))
+        last_exc = None
+        for hypervisor_ip in pmd_hypervisors:
+            try:
+                self._assert_pmd_matches_perf_show(
+                    hypervisor_ip, metric_name)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'PMD perf-show check failed on %s for %s: %s',
+                    hypervisor_ip, metric_name, exc)
+        self.fail(
+            'PMD metric %s did not match pmd-perf-show on any hypervisor %s; '
+            'last error: %s' % (metric_name, pmd_hypervisors, last_exc))
 
     def _assert_metric_on_compute_scrape(self, metric_name):
         """Verify metric_name is exported on at least one compute :9105 scrape."""
