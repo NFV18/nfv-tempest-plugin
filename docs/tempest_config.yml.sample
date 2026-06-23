@@ -98,6 +98,8 @@ test-networks:
 # computes (pmd-perf-show). Same network layout as network_exporter_generic_traffic.
 # network_exporter_pmd_cpu_usage validates ovs_pmd_cpu_overhead and ovs_pmd_rxq_usage
 # via pmd-rxq-show on DPDK computes.
+# network_exporter memory tests (test_ovs_memory_metrics) need DPDK/OVS computes with
+# perf metrics enabled on :9105; no tests-setup entry is required.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor

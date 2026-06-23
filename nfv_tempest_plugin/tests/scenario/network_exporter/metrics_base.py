@@ -101,6 +101,25 @@ OVS_PMD_CPU_USAGE_METRICS = (
     OVS_PMD_CPU_OVERHEAD_METRIC,
     OVS_PMD_RXQ_USAGE_METRIC,
 )
+OVS_MEMORY_HANDLERS_TOTAL_METRIC = 'ovs_memory_handlers_total'
+OVS_MEMORY_PORTS_TOTAL_METRIC = 'ovs_memory_ports_total'
+OVS_MEMORY_REVALIDATORS_TOTAL_METRIC = 'ovs_memory_revalidators_total'
+OVS_MEMORY_RULES_TOTAL_METRIC = 'ovs_memory_rules_total'
+OVS_MEMORY_KEYS_TOTAL_METRIC = 'ovs_memory_keys_total'
+OVS_MEMORY_METRICS = (
+    OVS_MEMORY_HANDLERS_TOTAL_METRIC,
+    OVS_MEMORY_PORTS_TOTAL_METRIC,
+    OVS_MEMORY_REVALIDATORS_TOTAL_METRIC,
+    OVS_MEMORY_RULES_TOTAL_METRIC,
+    OVS_MEMORY_KEYS_TOTAL_METRIC,
+)
+OVS_MEMORY_METRIC_TO_SHOW_KEY = {
+    OVS_MEMORY_HANDLERS_TOTAL_METRIC: 'handlers',
+    OVS_MEMORY_PORTS_TOTAL_METRIC: 'ports',
+    OVS_MEMORY_REVALIDATORS_TOTAL_METRIC: 'revalidators',
+    OVS_MEMORY_RULES_TOTAL_METRIC: 'rules',
+    OVS_MEMORY_KEYS_TOTAL_METRIC: 'keys',
+}
 OVS_PMD_METRIC_TO_PERF_STAT = {
     OVS_PMD_TOTAL_ITERATIONS_METRIC: 'Iterations',
     OVS_PMD_IDLE_ITERATIONS_METRIC: '- idle iterations',
@@ -185,6 +204,11 @@ PMD_PERF_SHOW_COMMANDS = (
 PMD_RXQ_SHOW_COMMANDS = (
     'sudo ovs-appctl dpif-netdev/pmd-rxq-show 2>/dev/null',
     'ovs-appctl dpif-netdev/pmd-rxq-show 2>/dev/null',
+)
+MEMORY_COUNT_RE = re.compile(r'(\w+):(\d+)')
+MEMORY_SHOW_COMMANDS = (
+    'sudo ovs-appctl memory/show 2>/dev/null',
+    'ovs-appctl memory/show 2>/dev/null',
 )
 PMD_RXQ_OVERHEAD_RE = re.compile(r'^\s*overhead\s*:\s*([\d.]+)\s*%$')
 PMD_RXQ_USAGE_RE = re.compile(
@@ -1517,6 +1541,137 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         self.fail(
             'PMD metric %s did not match pmd-rxq-show on any hypervisor %s; '
             'last error: %s' % (metric_name, pmd_hypervisors, last_exc))
+
+    def _ovs_memory_show_output(self, hypervisor_ip):
+        """Fetch ovs-appctl memory/show text (same source as network-exporter)."""
+        last_output = ''
+        for cmd in MEMORY_SHOW_COMMANDS:
+            output = self._ssh_run_on_hypervisor(
+                hypervisor_ip, cmd, check_rc=False)
+            if output and output.strip():
+                return output
+            last_output = output or last_output
+        self.fail(
+            'Could not get memory/show output on %s (last output: %r)' % (
+                hypervisor_ip, (last_output or '')[:500]))
+
+    def _ovs_memory_show_stats(self, hypervisor_ip, output=None):
+        """Parse memory/show counts for known exporter keys only."""
+        if output is None:
+            output = self._ovs_memory_show_output(hypervisor_ip)
+        known_keys = set(OVS_MEMORY_METRIC_TO_SHOW_KEY.values())
+        stats = {}
+        for match in MEMORY_COUNT_RE.finditer(output):
+            key = match.group(1)
+            if key in known_keys:
+                stats[key] = int(match.group(2))
+        return stats
+
+    def _memory_live_metric_value(self, hypervisor_ip, metric_name,
+                                  metrics_output=None):
+        """Read one unlabeled ovs_memory_* gauge from a :9105 scrape."""
+        if metrics_output is None:
+            metrics_output = self._scrape_compute_metrics_text(hypervisor_ip)
+        return self._parse_prom_metric_text(
+            metrics_output, metric_name, {})
+
+    def _memory_show_and_live_output(self, hypervisor_ip):
+        """Fetch memory/show and :9105 metrics in one SSH round-trip."""
+        cmd = (
+            'sudo ovs-appctl memory/show 2>/dev/null || '
+            'ovs-appctl memory/show 2>/dev/null; '
+            'curl -sk https://127.0.0.1:9105/metrics 2>/dev/null || '
+            'curl -s http://127.0.0.1:9105/metrics 2>/dev/null')
+        return self._ssh_run_on_hypervisor(hypervisor_ip, cmd, check_rc=False)
+
+    def _hypervisors_with_memory_show(self, hypervisors):
+        """Return hypervisors that export memory/show stats."""
+        found = []
+        for hypervisor_ip in hypervisors:
+            try:
+                stats = self._ovs_memory_show_stats(hypervisor_ip)
+                if stats:
+                    found.append(hypervisor_ip)
+            except Exception as exc:
+                LOG.warning(
+                    'No memory/show on %s: %s', hypervisor_ip, exc)
+        return found
+
+    def _assert_memory_matches_show(self, hypervisor_ip, metric_name):
+        """Assert live :9105 ovs_memory_* equals memory/show on hypervisor."""
+        show_key = OVS_MEMORY_METRIC_TO_SHOW_KEY.get(metric_name)
+        self.assertIsNotNone(
+            show_key, 'No memory/show mapping for metric %s' % metric_name)
+        last_exc = None
+        for attempt in range(METRIC_RETRY_ATTEMPTS):
+            combined = self._memory_show_and_live_output(hypervisor_ip)
+            stats = self._ovs_memory_show_stats(
+                hypervisor_ip, output=combined)
+            expected = stats.get(show_key)
+            reported = self._memory_live_metric_value(
+                hypervisor_ip, metric_name, metrics_output=combined)
+            try:
+                self.assertIsNotNone(
+                    expected,
+                    'memory/show missing %s on %s' % (
+                        show_key, hypervisor_ip))
+                self.assertIsNotNone(
+                    reported,
+                    '%s missing on live :9105 on %s' % (
+                        metric_name, hypervisor_ip))
+                self.assertEqual(
+                    expected, reported,
+                    '%s on %s: memory/show %s=%s live=%s' % (
+                        metric_name, hypervisor_ip, show_key,
+                        expected, reported))
+                LOG.warning(
+                    'Memory %s aligned with memory/show on %s (attempt %s): '
+                    'show=%s live=%s',
+                    metric_name, hypervisor_ip, attempt + 1,
+                    expected, reported)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'Attempt %s/%s waiting for memory %s on %s: %s',
+                    attempt + 1, METRIC_RETRY_ATTEMPTS, metric_name,
+                    hypervisor_ip, exc)
+            if attempt < METRIC_RETRY_ATTEMPTS - 1:
+                time.sleep(METRIC_RETRY_INTERVAL)
+        if last_exc is not None:
+            raise last_exc
+        self.fail(
+            'Timed out waiting for memory %s on %s to match memory/show' % (
+                metric_name, hypervisor_ip))
+
+    def _assert_memory_metric_reported(self, metric_name):
+        """Assert ovs_memory_* via metric show, :9105, and memory/show."""
+        self._assert_ovs_interface_metric_reported(metric_name)
+        hypervisors = self._get_ssh_hypervisors('')
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisors available for memory metric %s' % (
+                metric_name))
+        memory_hypervisors = self._hypervisors_with_memory_show(hypervisors)
+        self.assertNotEmpty(
+            memory_hypervisors,
+            'No memory/show output on hypervisors %s for %s' % (
+                hypervisors, metric_name))
+        last_exc = None
+        for hypervisor_ip in memory_hypervisors:
+            try:
+                self._assert_memory_matches_show(
+                    hypervisor_ip, metric_name)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'memory/show check failed on %s for %s: %s',
+                    hypervisor_ip, metric_name, exc)
+        self.fail(
+            'Memory metric %s did not match memory/show on any hypervisor '
+            '%s; last error: %s' % (
+                metric_name, memory_hypervisors, last_exc))
 
     def _max_rxq_usage_percent(self, hypervisor_ip, output=None):
         """Return peak RxQ usage percent from pmd-rxq-show and live :9105."""
