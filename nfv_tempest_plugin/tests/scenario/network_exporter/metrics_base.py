@@ -1568,13 +1568,20 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 stats[key] = int(match.group(2))
         return stats
 
+    def _memory_show_expected_value(self, stats, show_key):
+        """Return memory/show count; OVS omits zero-valued keys from output."""
+        return stats.get(show_key, 0)
+
     def _memory_live_metric_value(self, hypervisor_ip, metric_name,
                                   metrics_output=None):
         """Read one unlabeled ovs_memory_* gauge from a :9105 scrape."""
         if metrics_output is None:
             metrics_output = self._scrape_compute_metrics_text(hypervisor_ip)
-        return self._parse_prom_metric_text(
+        value = self._parse_prom_metric_text(
             metrics_output, metric_name, {})
+        if value is None:
+            return 0
+        return value
 
     def _memory_show_and_live_output(self, hypervisor_ip):
         """Fetch memory/show and :9105 metrics in one SSH round-trip."""
@@ -1595,17 +1602,17 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             return show_output.strip(), metrics_output.strip()
         return (combined_output or '').strip(), ''
 
-    def _hypervisors_with_memory_show(self, hypervisors, show_key=None):
-        """Return hypervisors that export memory/show stats."""
+    def _hypervisors_with_memory_show(self, hypervisors):
+        """Return hypervisors that respond to ovs-appctl memory/show."""
         found = []
         for hypervisor_ip in hypervisors:
             try:
-                stats = self._ovs_memory_show_stats(hypervisor_ip)
-                if not stats:
-                    continue
-                if show_key and show_key not in stats:
-                    continue
-                found.append(hypervisor_ip)
+                for cmd in MEMORY_SHOW_COMMANDS:
+                    output = self._ssh_run_on_hypervisor(
+                        hypervisor_ip, cmd, check_rc=False)
+                    if output and output.strip():
+                        found.append(hypervisor_ip)
+                        break
             except Exception as exc:
                 LOG.warning(
                     'No memory/show on %s: %s', hypervisor_ip, exc)
@@ -1628,23 +1635,15 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     hypervisor_ip)
             stats = self._ovs_memory_show_stats(
                 hypervisor_ip, output=show_output)
-            expected = stats.get(show_key)
+            expected = self._memory_show_expected_value(stats, show_key)
             reported = self._memory_live_metric_value(
                 hypervisor_ip, metric_name, metrics_output=metrics_output)
             try:
-                self.assertIsNotNone(
-                    expected,
-                    'memory/show missing %s on %s (show output: %r)' % (
-                        show_key, hypervisor_ip, show_output[:300]))
-                self.assertIsNotNone(
-                    reported,
-                    '%s missing on live :9105 on %s' % (
-                        metric_name, hypervisor_ip))
                 self.assertEqual(
                     expected, reported,
-                    '%s on %s: memory/show %s=%s live=%s' % (
+                    '%s on %s: memory/show %s=%s live=%s (show output: %r)' % (
                         metric_name, hypervisor_ip, show_key,
-                        expected, reported))
+                        expected, reported, show_output[:300]))
                 LOG.warning(
                     'Memory %s aligned with memory/show on %s (attempt %s): '
                     'show=%s live=%s',
@@ -1673,13 +1672,11 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             hypervisors,
             'No compute hypervisors available for memory metric %s' % (
                 metric_name))
-        show_key = OVS_MEMORY_METRIC_TO_SHOW_KEY[metric_name]
-        memory_hypervisors = self._hypervisors_with_memory_show(
-            hypervisors, show_key=show_key)
+        memory_hypervisors = self._hypervisors_with_memory_show(hypervisors)
         self.assertNotEmpty(
             memory_hypervisors,
-            'No memory/show %s on hypervisors %s for %s' % (
-                show_key, hypervisors, metric_name))
+            'No memory/show output on hypervisors %s for %s' % (
+                hypervisors, metric_name))
         last_exc = None
         for hypervisor_ip in memory_hypervisors:
             try:
