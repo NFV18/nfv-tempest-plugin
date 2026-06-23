@@ -100,6 +100,9 @@ test-networks:
 # via pmd-rxq-show on DPDK computes.
 # network_exporter memory tests (test_ovs_memory_metrics) need DPDK/OVS computes with
 # perf metrics enabled on :9105; no tests-setup entry is required.
+# network_exporter OVN controller tests (test_ovnc_config_metrics,
+# test_ovnc_txn_metrics) need OVN :1981 on computes; txn counters require DEBUG
+# and ERRORS metric sets on network-exporter; no tests-setup entry is required.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
     flavor: nfv_qe_base_flavor

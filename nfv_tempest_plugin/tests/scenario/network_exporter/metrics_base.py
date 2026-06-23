@@ -71,6 +71,41 @@ OVS_INTERFACE_ERROR_STAT_TO_METRIC = {
 }
 OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC = 'ovnc_router_port_traffic_pkts'
 OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC = 'ovnc_router_port_traffic_bytes'
+OVNC_ENCAP_IP_METRIC = 'ovnc_encap_ip'
+OVNC_ENCAP_TYPE_METRIC = 'ovnc_encap_type'
+OVNC_SB_CONNECTION_METHOD_METRIC = 'ovnc_sb_connection_method'
+OVNC_MONITOR_ALL_METRIC = 'ovnc_monitor_all'
+OVNC_BRIDGE_MAPPINGS_METRIC = 'ovnc_bridge_mappings'
+OVNC_CONFIG_METRICS = (
+    OVNC_ENCAP_IP_METRIC,
+    OVNC_ENCAP_TYPE_METRIC,
+    OVNC_SB_CONNECTION_METHOD_METRIC,
+    OVNC_MONITOR_ALL_METRIC,
+    OVNC_BRIDGE_MAPPINGS_METRIC,
+)
+OVNC_TXN_SUCCESS_METRIC = 'ovnc_txn_success'
+OVNC_TXN_UNCOMMITTED_METRIC = 'ovnc_txn_uncommitted'
+OVNC_TXN_ABORTED_METRIC = 'ovnc_txn_aborted'
+OVNC_TXN_ERROR_METRIC = 'ovnc_txn_error'
+OVNC_TXN_METRICS = (
+    OVNC_TXN_SUCCESS_METRIC,
+    OVNC_TXN_UNCOMMITTED_METRIC,
+    OVNC_TXN_ABORTED_METRIC,
+    OVNC_TXN_ERROR_METRIC,
+)
+OVNC_METRIC_TO_EXTERNAL_ID = {
+    OVNC_ENCAP_IP_METRIC: ('ovn-encap-ip', 'encap_ip'),
+    OVNC_ENCAP_TYPE_METRIC: ('ovn-encap-type', 'encap_type'),
+    OVNC_SB_CONNECTION_METHOD_METRIC: ('ovn-remote', 'sb_connection_method'),
+    OVNC_MONITOR_ALL_METRIC: ('ovn-monitor-all', None),
+    OVNC_BRIDGE_MAPPINGS_METRIC: ('ovn-bridge-mappings', None),
+}
+OVNC_TXN_METRIC_TO_COVERAGE_KEY = {
+    OVNC_TXN_SUCCESS_METRIC: 'txn_success',
+    OVNC_TXN_UNCOMMITTED_METRIC: 'txn_uncommitted',
+    OVNC_TXN_ABORTED_METRIC: 'txn_aborted',
+    OVNC_TXN_ERROR_METRIC: 'txn_error',
+}
 OVS_DATAPATH_FLOWS_TOTAL_METRIC = 'ovs_datapath_flows_total'
 OVS_DATAPATH_LOOKUP_HITS_TOTAL_METRIC = 'ovs_datapath_lookup_hits_total'
 OVS_DATAPATH_LOOKUP_MISSED_TOTAL_METRIC = 'ovs_datapath_lookup_missed_total'
@@ -211,6 +246,14 @@ MEMORY_SHOW_COMMANDS = (
     'sudo ovs-appctl memory/show 2>/dev/null',
     'ovs-appctl memory/show 2>/dev/null',
 )
+OVN_COVERAGE_TOTAL_RE = re.compile(
+    r'^(\w+)\s+.*\s+total:\s*(\d+)\s*$')
+OVN_COVERAGE_METRICS_DELIMITER = '---OVN_COVERAGE_METRICS---'
+OVN_COVERAGE_SHOW_COMMANDS = (
+    'sudo ovs-appctl -t ovn-controller coverage/show 2>/dev/null',
+    'ovs-appctl -t ovn-controller coverage/show 2>/dev/null',
+)
+OVS_EXTERNAL_ID_RE = re.compile(r'([\w-]+)="([^"]*)"')
 PMD_RXQ_OVERHEAD_RE = re.compile(r'^\s*overhead\s*:\s*([\d.]+)\s*%$')
 PMD_RXQ_USAGE_RE = re.compile(
     r'^\s*port:\s*(\S+)\s+queue-id:\s*(\d+)\s+\((enabled|disabled)\)\s+'
@@ -761,6 +804,10 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
 
     def _assert_router_port_metric_reported(self, metric_name):
         """Assert ovnc_router_port_traffic_* via openstack metric show and storage."""
+        self._assert_ovn_controller_metric_reported(metric_name)
+
+    def _assert_ovn_controller_metric_reported(self, metric_name):
+        """Assert OVN :1981 metrics via metric show, storage, and live scrape."""
         self._assert_metric_reported(metric_name)
         storage_samples, query_error = self._metric_storage_samples(metric_name)
         self.assertNotEmpty(
@@ -770,7 +817,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         if not self._metric_on_ovn_scrape(metric_name):
             LOG.warning(
                 '%s present in metric-storage but not on a Tempest-reachable '
-                'OVN :1981 scrape; router port tests use metric-storage',
+                'OVN :1981 scrape',
                 metric_name)
 
     def _router_port_label_key(self, labels):
@@ -1692,6 +1739,350 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             'Memory metric %s did not match memory/show on any hypervisor '
             '%s; last error: %s' % (
                 metric_name, memory_hypervisors, last_exc))
+
+    def _ovs_open_vswitch_external_ids(self, hypervisor_ip):
+        """Parse Open_vSwitch external_ids from ovs-vsctl on a compute node."""
+        last_output = ''
+        for cmd in (
+                'sudo ovs-vsctl get Open_vSwitch . external_ids 2>/dev/null',
+                'ovs-vsctl get Open_vSwitch . external_ids 2>/dev/null'):
+            output = self._ssh_run_on_hypervisor(
+                hypervisor_ip, cmd, check_rc=False)
+            if output and output.strip():
+                return dict(OVS_EXTERNAL_ID_RE.findall(output))
+            last_output = output or last_output
+        self.fail(
+            'Could not get Open_vSwitch external_ids on %s (last output: %r)' % (
+                hypervisor_ip, (last_output or '')[:500]))
+
+    def _ovnc_bridge_mappings_pairs(self, external_ids):
+        """Return (network, bridge) pairs from ovn-bridge-mappings external_id."""
+        mappings = external_ids.get('ovn-bridge-mappings', '')
+        if not mappings:
+            return []
+        pairs = []
+        for item in mappings.split(','):
+            item = item.strip()
+            if not item or ':' not in item:
+                continue
+            network, bridge = item.split(':', 1)
+            pairs.append((network.strip(), bridge.strip()))
+        return pairs
+
+    def _ovn_coverage_show_output(self, hypervisor_ip):
+        """Fetch ovn-controller coverage/show text (exporter ground truth)."""
+        last_output = ''
+        for cmd in OVN_COVERAGE_SHOW_COMMANDS:
+            output = self._ssh_run_on_hypervisor(
+                hypervisor_ip, cmd, check_rc=False)
+            if output and output.strip():
+                return output
+            last_output = output or last_output
+        self.fail(
+            'Could not get ovn-controller coverage/show on %s (last output: %r)'
+            % (hypervisor_ip, (last_output or '')[:500]))
+
+    def _ovn_coverage_totals(self, hypervisor_ip, output=None):
+        """Parse coverage/show totals for known ovnc_txn_* keys only."""
+        if output is None:
+            output = self._ovn_coverage_show_output(hypervisor_ip)
+        known_keys = set(OVNC_TXN_METRIC_TO_COVERAGE_KEY.values())
+        totals = {}
+        for line in (output or '').splitlines():
+            match = OVN_COVERAGE_TOTAL_RE.match(line.strip())
+            if not match:
+                continue
+            key = match.group(1)
+            if key in known_keys:
+                totals[key] = int(match.group(2))
+        return totals
+
+    def _ovnc_live_samples(self, hypervisor_ip, metric_name,
+                           metrics_output=None):
+        """Parse labeled/unlabeled OVN :1981 samples for one metric."""
+        if metrics_output is not None:
+            return self._parse_prom_samples(metrics_output, metric_name)
+        samples = []
+        for _source, output in self._ovn_metric_scrape_outputs(hypervisor_ip):
+            samples.extend(self._parse_prom_samples(output, metric_name))
+        return samples
+
+    def _ovnc_live_metric_value(self, hypervisor_ip, metric_name,
+                                metrics_output=None):
+        """Return peak live :1981 value for an unlabeled ovnc_txn_* counter."""
+        samples = self._ovnc_live_samples(
+            hypervisor_ip, metric_name, metrics_output=metrics_output)
+        if not samples:
+            return 0
+        return max(sample['value'] for sample in samples)
+
+    def _ovn_coverage_and_live_output(self, hypervisor_ip):
+        """Fetch coverage/show and :1981 metrics in one SSH round-trip."""
+        cmd = (
+            "COVERAGE=$(sudo ovs-appctl -t ovn-controller coverage/show "
+            "2>/dev/null || ovs-appctl -t ovn-controller coverage/show "
+            "2>/dev/null); "
+            "printf '%%s\\n%s\\n' \"$COVERAGE\" '%s'; "
+            "curl -sk https://127.0.0.1:1981/metrics 2>/dev/null || "
+            "curl -s http://127.0.0.1:1981/metrics 2>/dev/null"
+            % (OVN_COVERAGE_METRICS_DELIMITER,
+               OVN_COVERAGE_METRICS_DELIMITER))
+        return self._ssh_run_on_hypervisor(hypervisor_ip, cmd, check_rc=False)
+
+    def _split_ovn_coverage_and_metrics(self, combined_output):
+        """Split combined SSH output into coverage/show text and :1981 scrape."""
+        if OVN_COVERAGE_METRICS_DELIMITER in (combined_output or ''):
+            coverage_output, metrics_output = combined_output.split(
+                OVN_COVERAGE_METRICS_DELIMITER, 1)
+            return coverage_output.strip(), metrics_output.strip()
+        return (combined_output or '').strip(), ''
+
+    def _hypervisors_with_ovn_controller(self, hypervisors):
+        """Return hypervisors with OVN controller config or coverage/show."""
+        found = []
+        for hypervisor_ip in hypervisors:
+            try:
+                for cmd in (
+                        'sudo ovs-vsctl get Open_vSwitch . external_ids '
+                        '2>/dev/null',
+                        'ovs-vsctl get Open_vSwitch . external_ids '
+                        '2>/dev/null'):
+                    output = self._ssh_run_on_hypervisor(
+                        hypervisor_ip, cmd, check_rc=False)
+                    if output.strip():
+                        ext_ids = dict(OVS_EXTERNAL_ID_RE.findall(output))
+                        if ext_ids.get('ovn-remote'):
+                            found.append(hypervisor_ip)
+                            break
+                else:
+                    for cmd in OVN_COVERAGE_SHOW_COMMANDS:
+                        output = self._ssh_run_on_hypervisor(
+                            hypervisor_ip, cmd, check_rc=False)
+                        if output and output.strip():
+                            found.append(hypervisor_ip)
+                            break
+            except Exception as exc:
+                LOG.warning(
+                    'No OVN controller on %s: %s', hypervisor_ip, exc)
+        return found
+
+    def _expected_ovnc_monitor_all(self, external_ids):
+        """Map ovn-monitor-all external_id to exporter gauge 0/1."""
+        value = external_ids.get('ovn-monitor-all', '')
+        return 1 if value.lower() == 'true' else 0
+
+    def _assert_ovnc_config_matches_external_ids(
+            self, hypervisor_ip, metric_name):
+        """Assert live :1981 ovnc_* config metrics match ovs-vsctl external_ids."""
+        mapping = OVNC_METRIC_TO_EXTERNAL_ID.get(metric_name)
+        self.assertIsNotNone(
+            mapping, 'No external_ids mapping for metric %s' % metric_name)
+        ext_id_key, label_key = mapping
+        external_ids = self._ovs_open_vswitch_external_ids(hypervisor_ip)
+        live_samples = self._ovnc_live_samples(hypervisor_ip, metric_name)
+        self.assertNotEmpty(
+            live_samples,
+            '%s missing on live OVN :1981 on %s' % (
+                metric_name, hypervisor_ip))
+
+        if metric_name == OVNC_MONITOR_ALL_METRIC:
+            expected = self._expected_ovnc_monitor_all(external_ids)
+            unlabeled = [
+                sample['value'] for sample in live_samples
+                if not sample['labels']]
+            self.assertNotEmpty(
+                unlabeled,
+                '%s has no unlabeled live samples on %s' % (
+                    metric_name, hypervisor_ip))
+            reported = unlabeled[0]
+            self.assertEqual(
+                expected, reported,
+                '%s on %s: external_ids %s=%s live=%s' % (
+                    metric_name, hypervisor_ip, ext_id_key,
+                    external_ids.get(ext_id_key), reported))
+            return
+
+        if metric_name == OVNC_BRIDGE_MAPPINGS_METRIC:
+            pairs = self._ovnc_bridge_mappings_pairs(external_ids)
+            self.assertNotEmpty(
+                pairs,
+                'ovn-bridge-mappings missing on %s for %s' % (
+                    hypervisor_ip, metric_name))
+            live_map = {
+                (sample['labels'].get('network'),
+                 sample['labels'].get('bridge')): sample['value']
+                for sample in live_samples
+            }
+            for network, bridge in pairs:
+                reported = live_map.get((network, bridge))
+                self.assertIsNotNone(
+                    reported,
+                    '%s missing network=%s bridge=%s on %s (live labels %s)' % (
+                        metric_name, network, bridge, hypervisor_ip,
+                        sorted(live_map.keys())))
+                self.assertEqual(
+                    1, reported,
+                    '%s on %s network=%s bridge=%s: expected 1 live=%s' % (
+                        metric_name, hypervisor_ip, network, bridge,
+                        reported))
+            return
+
+        expected_value = external_ids.get(ext_id_key)
+        self.assertIsNotNone(
+            expected_value,
+            '%s missing from external_ids on %s' % (
+                ext_id_key, hypervisor_ip))
+        matching = [
+            sample for sample in live_samples
+            if sample['labels'].get(label_key) == expected_value]
+        self.assertNotEmpty(
+            matching,
+            '%s on %s: no live sample with %s=%r (external_ids); live %s' % (
+                metric_name, hypervisor_ip, label_key, expected_value,
+                [sample['labels'] for sample in live_samples]))
+        for sample in matching:
+            self.assertEqual(
+                1, sample['value'],
+                '%s on %s %s=%s: expected gauge 1 live=%s' % (
+                    metric_name, hypervisor_ip, label_key, expected_value,
+                    sample['value']))
+
+    def _assert_ovnc_config_metric_reported(self, metric_name):
+        """Assert ovnc_* config via metric show, storage, and external_ids."""
+        self._assert_ovn_controller_metric_reported(metric_name)
+        hypervisors = self._get_ssh_hypervisors('')
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisors available for OVN config metric %s' % (
+                metric_name))
+        ovn_hypervisors = self._hypervisors_with_ovn_controller(hypervisors)
+        self.assertNotEmpty(
+            ovn_hypervisors,
+            'No OVN controller on hypervisors %s for %s' % (
+                hypervisors, metric_name))
+        if metric_name == OVNC_BRIDGE_MAPPINGS_METRIC:
+            ovn_hypervisors = [
+                hypervisor_ip for hypervisor_ip in ovn_hypervisors
+                if self._ovnc_bridge_mappings_pairs(
+                    self._ovs_open_vswitch_external_ids(hypervisor_ip))]
+            self.assertNotEmpty(
+                ovn_hypervisors,
+                'No ovn-bridge-mappings on hypervisors for %s' % metric_name)
+        last_exc = None
+        for hypervisor_ip in ovn_hypervisors:
+            try:
+                self._assert_ovnc_config_matches_external_ids(
+                    hypervisor_ip, metric_name)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'OVN config check failed on %s for %s: %s',
+                    hypervisor_ip, metric_name, exc)
+        self.fail(
+            'OVN config metric %s did not match external_ids on any '
+            'hypervisor %s; last error: %s' % (
+                metric_name, ovn_hypervisors, last_exc))
+
+    def _assert_ovnc_txn_matches_coverage(self, hypervisor_ip, metric_name):
+        """Assert live :1981 ovnc_txn_* equals coverage/show on hypervisor."""
+        coverage_key = OVNC_TXN_METRIC_TO_COVERAGE_KEY.get(metric_name)
+        self.assertIsNotNone(
+            coverage_key,
+            'No coverage/show mapping for metric %s' % metric_name)
+        last_exc = None
+        for attempt in range(METRIC_RETRY_ATTEMPTS):
+            combined = self._ovn_coverage_and_live_output(hypervisor_ip)
+            coverage_output, metrics_output = (
+                self._split_ovn_coverage_and_metrics(combined))
+            if not coverage_output:
+                coverage_output = self._ovn_coverage_show_output(hypervisor_ip)
+            if not metrics_output:
+                for _source, output in self._ovn_metric_scrape_outputs(
+                        hypervisor_ip):
+                    if output.strip():
+                        metrics_output = output
+                        break
+            totals = self._ovn_coverage_totals(
+                hypervisor_ip, output=coverage_output)
+            expected = totals.get(coverage_key, 0)
+            reported = self._ovnc_live_metric_value(
+                hypervisor_ip, metric_name, metrics_output=metrics_output)
+            try:
+                self.assertEqual(
+                    expected, reported,
+                    '%s on %s: coverage/show %s=%s live=%s' % (
+                        metric_name, hypervisor_ip, coverage_key,
+                        expected, reported))
+                LOG.warning(
+                    'OVN txn %s aligned with coverage/show on %s (attempt %s): '
+                    'show=%s live=%s',
+                    metric_name, hypervisor_ip, attempt + 1,
+                    expected, reported)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'Attempt %s/%s waiting for OVN txn %s on %s: %s',
+                    attempt + 1, METRIC_RETRY_ATTEMPTS, metric_name,
+                    hypervisor_ip, exc)
+            if attempt < METRIC_RETRY_ATTEMPTS - 1:
+                time.sleep(METRIC_RETRY_INTERVAL)
+        if last_exc is not None:
+            raise last_exc
+        self.fail(
+            'Timed out waiting for OVN txn %s on %s to match coverage/show' % (
+                metric_name, hypervisor_ip))
+
+    def _assert_ovnc_txn_metric_reported(self, metric_name):
+        """Assert ovnc_txn_* via metric show, storage, and coverage/show."""
+        self._assert_ovn_controller_metric_reported(metric_name)
+        hypervisors = self._get_ssh_hypervisors('')
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisors available for OVN txn metric %s' % (
+                metric_name))
+        ovn_hypervisors = self._hypervisors_with_ovn_controller(hypervisors)
+        self.assertNotEmpty(
+            ovn_hypervisors,
+            'No OVN controller on hypervisors %s for %s' % (
+                hypervisors, metric_name))
+        last_exc = None
+        for hypervisor_ip in ovn_hypervisors:
+            try:
+                self._assert_ovnc_txn_matches_coverage(
+                    hypervisor_ip, metric_name)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'OVN txn check failed on %s for %s: %s',
+                    hypervisor_ip, metric_name, exc)
+        self.fail(
+            'OVN txn metric %s did not match coverage/show on any hypervisor '
+            '%s; last error: %s' % (
+                metric_name, ovn_hypervisors, last_exc))
+
+    def _ovnc_txn_success_totals(self, hypervisor_ip):
+        """Return (coverage/show total, live :1981 value) for txn_success."""
+        combined = self._ovn_coverage_and_live_output(hypervisor_ip)
+        coverage_output, metrics_output = (
+            self._split_ovn_coverage_and_metrics(combined))
+        if not coverage_output:
+            coverage_output = self._ovn_coverage_show_output(hypervisor_ip)
+        if not metrics_output:
+            for _source, output in self._ovn_metric_scrape_outputs(
+                    hypervisor_ip):
+                if output.strip():
+                    metrics_output = output
+                    break
+        totals = self._ovn_coverage_totals(
+            hypervisor_ip, output=coverage_output)
+        show_total = totals.get('txn_success', 0)
+        live_total = self._ovnc_live_metric_value(
+            hypervisor_ip, OVNC_TXN_SUCCESS_METRIC,
+            metrics_output=metrics_output)
+        return show_total, live_total
 
     def _max_rxq_usage_percent(self, hypervisor_ip, output=None):
         """Return peak RxQ usage percent from pmd-rxq-show and live :9105."""
