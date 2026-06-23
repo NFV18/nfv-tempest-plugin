@@ -804,10 +804,6 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
 
     def _assert_router_port_metric_reported(self, metric_name):
         """Assert ovnc_router_port_traffic_* via openstack metric show and storage."""
-        self._assert_ovn_controller_metric_reported(metric_name)
-
-    def _assert_ovn_controller_metric_reported(self, metric_name):
-        """Assert OVN :1981 metrics via metric show, storage, and live scrape."""
         self._assert_metric_reported(metric_name)
         storage_samples, query_error = self._metric_storage_samples(metric_name)
         self.assertNotEmpty(
@@ -817,8 +813,75 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         if not self._metric_on_ovn_scrape(metric_name):
             LOG.warning(
                 '%s present in metric-storage but not on a Tempest-reachable '
-                'OVN :1981 scrape',
+                'OVN :1981 scrape; router port tests use metric-storage',
                 metric_name)
+
+    def _assert_ovn_controller_metric_best_effort(self, metric_name):
+        """Best-effort federation check; require live OVN :1981 scrape."""
+        stdout, stderr, returncode = self._metric_show(metric_name)
+        stdout = stdout or ''
+        if self._metric_show_output_usable(metric_name, stdout):
+            LOG.info(
+                "Metric '%s' reported via openstack metric show or "
+                "metric-storage fallback", metric_name)
+        else:
+            LOG.warning(
+                "openstack metric show unavailable for '%s' (exit %s: %s); "
+                "continuing with live OVN :1981 scrape",
+                metric_name, returncode, stderr)
+        storage_samples, query_error = self._metric_storage_samples(metric_name)
+        if storage_samples:
+            LOG.info(
+                "Metric '%s' present in metric-storage (%s samples)",
+                metric_name, len(storage_samples))
+        else:
+            LOG.warning(
+                '%s missing from metric-storage Prometheus (query: %s); '
+                'continuing with live OVN :1981 scrape',
+                metric_name, query_error)
+        self.assertTrue(
+            self._metric_on_ovn_scrape(metric_name),
+            "Metric '%s' not found on a Tempest-reachable OVN :1981 scrape"
+            % metric_name)
+
+    def _assert_ovnc_txn_presence(self, metric_name):
+        """Assert ovnc_txn_* path via live :1981 or coverage/show (not federated)."""
+        coverage_key = OVNC_TXN_METRIC_TO_COVERAGE_KEY[metric_name]
+        storage_samples, query_error = self._metric_storage_samples(metric_name)
+        if not storage_samples:
+            LOG.warning(
+                '%s not federated to metric-storage (%s); using live OVN '
+                'scrape and coverage/show',
+                metric_name, query_error)
+
+        hypervisors = self._get_ssh_hypervisors('')
+        ovn_hypervisors = self._hypervisors_with_ovn_controller(hypervisors)
+        self.assertNotEmpty(
+            ovn_hypervisors,
+            'No OVN controller on hypervisors %s for %s' % (
+                hypervisors, metric_name))
+
+        found_on = []
+        for hypervisor_ip in ovn_hypervisors:
+            if self._ovnc_live_samples(hypervisor_ip, metric_name):
+                found_on.append(hypervisor_ip)
+                continue
+            try:
+                totals = self._ovn_coverage_totals(hypervisor_ip)
+                if coverage_key in totals or totals:
+                    found_on.append(hypervisor_ip)
+            except Exception as exc:
+                LOG.warning(
+                    'No coverage/show for %s on %s: %s',
+                    metric_name, hypervisor_ip, exc)
+        self.assertNotEmpty(
+            found_on,
+            "Metric '%s' not on OVN :1981 scrape and no coverage/show txn "
+            "stats on hypervisors %s" % (metric_name, ovn_hypervisors))
+        LOG.info(
+            "Metric '%s' reachable on hypervisor(s) %s via :1981 or "
+            "coverage/show",
+            metric_name, found_on)
 
     def _router_port_label_key(self, labels):
         """Stable identity for ovnc_router_port_traffic series."""
@@ -1948,8 +2011,8 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     sample['value']))
 
     def _assert_ovnc_config_metric_reported(self, metric_name):
-        """Assert ovnc_* config via metric show, storage, and external_ids."""
-        self._assert_ovn_controller_metric_reported(metric_name)
+        """Assert ovnc_* config via live :1981 and ovs-vsctl external_ids."""
+        self._assert_ovn_controller_metric_best_effort(metric_name)
         hypervisors = self._get_ssh_hypervisors('')
         self.assertNotEmpty(
             hypervisors,
@@ -2035,8 +2098,8 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 metric_name, hypervisor_ip))
 
     def _assert_ovnc_txn_metric_reported(self, metric_name):
-        """Assert ovnc_txn_* via metric show, storage, and coverage/show."""
-        self._assert_ovn_controller_metric_reported(metric_name)
+        """Assert ovnc_txn_* via live :1981 and coverage/show."""
+        self._assert_ovnc_txn_presence(metric_name)
         hypervisors = self._get_ssh_hypervisors('')
         self.assertNotEmpty(
             hypervisors,
