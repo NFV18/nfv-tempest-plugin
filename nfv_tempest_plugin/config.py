@@ -180,6 +180,15 @@ NfvPluginOptions = [
                default=5000000,
                help='Minimum allowed absolute drift between sequential PMD '
                     'perf-show and exporter reads.'),
+    cfg.FloatOpt('network_exporter_pmd_gauge_tolerance',
+                 default=1.0,
+                 help='Allowed absolute percent-point drift between '
+                      'pmd-rxq-show and live :9105 for ovs_pmd_cpu_overhead '
+                      'and ovs_pmd_rxq_usage gauges.'),
+    cfg.FloatOpt('network_exporter_pmd_min_rxq_usage_pct',
+                 default=1.0,
+                 help='Minimum ovs_pmd_rxq_usage peak after VM traffic on at '
+                      'least one enabled RxQ.'),
     cfg.IntOpt('network_exporter_error_udp_flood_packets',
                default=50000,
                help='UDP datagrams sent at high rate to a peer dataplane IP '

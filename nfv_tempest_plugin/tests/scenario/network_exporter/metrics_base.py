@@ -95,6 +95,12 @@ OVS_PMD_PACKET_METRICS = (
     OVS_PMD_RX_PACKETS_METRIC,
     OVS_PMD_TX_PACKETS_METRIC,
 )
+OVS_PMD_CPU_OVERHEAD_METRIC = 'ovs_pmd_cpu_overhead'
+OVS_PMD_RXQ_USAGE_METRIC = 'ovs_pmd_rxq_usage'
+OVS_PMD_CPU_USAGE_METRICS = (
+    OVS_PMD_CPU_OVERHEAD_METRIC,
+    OVS_PMD_RXQ_USAGE_METRIC,
+)
 OVS_PMD_METRIC_TO_PERF_STAT = {
     OVS_PMD_TOTAL_ITERATIONS_METRIC: 'Iterations',
     OVS_PMD_IDLE_ITERATIONS_METRIC: '- idle iterations',
@@ -176,6 +182,14 @@ PMD_PERF_SHOW_COMMANDS = (
     'sudo ovs-appctl dpif-netdev/pmd-perf-show 2>/dev/null',
     'ovs-appctl dpif-netdev/pmd-perf-show 2>/dev/null',
 )
+PMD_RXQ_SHOW_COMMANDS = (
+    'sudo ovs-appctl dpif-netdev/pmd-rxq-show 2>/dev/null',
+    'ovs-appctl dpif-netdev/pmd-rxq-show 2>/dev/null',
+)
+PMD_RXQ_OVERHEAD_RE = re.compile(r'^\s*overhead\s*:\s*([\d.]+)\s*%$')
+PMD_RXQ_USAGE_RE = re.compile(
+    r'^\s*port:\s*(\S+)\s+queue-id:\s*(\d+)\s+\((enabled|disabled)\)\s+'
+    r'pmd usage:\s*([\d.]+)\s*%$')
 METRIC_ROW_VALUE_RE = re.compile(r'(\d+)\s*\|?\s*$')
 COMPUTE_METRICS_HOST_RE = re.compile(
     r'(\d+\.\d+\.\d+\.\d+)' + re.escape(NETWORK_EXPORTER_INSTANCE_PORT))
@@ -1318,6 +1332,201 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         self.fail(
             'PMD metric %s did not match pmd-perf-show on any hypervisor %s; '
             'last error: %s' % (metric_name, pmd_hypervisors, last_exc))
+
+    def _pmd_rxq_show_output(self, hypervisor_ip):
+        """Fetch dpif-netdev/pmd-rxq-show (same source as network-exporter)."""
+        last_output = ''
+        for cmd in PMD_RXQ_SHOW_COMMANDS:
+            output = self._ssh_run_on_hypervisor(
+                hypervisor_ip, cmd, check_rc=False)
+            if output and output.strip():
+                return output
+            last_output = output or last_output
+        self.fail(
+            'Could not get pmd-rxq-show on %s (last output: %r)' % (
+                hypervisor_ip, (last_output or '')[:500]))
+
+    def _ovs_pmd_rxq_stats(self, hypervisor_ip, output=None):
+        """Parse pmd-rxq-show into overhead and per-Rxq usage percentages."""
+        if output is None:
+            output = self._pmd_rxq_show_output(hypervisor_ip)
+        overhead = {}
+        rxq_usage = {}
+        numa = cpu = None
+        for line in output.splitlines():
+            thread = PMD_THREAD_RE.match(line)
+            if thread:
+                numa, cpu = thread.group(1), thread.group(2)
+                continue
+            if numa is None:
+                continue
+            oh = PMD_RXQ_OVERHEAD_RE.match(line)
+            if oh:
+                overhead[(numa, cpu)] = float(oh.group(1))
+                continue
+            rxq = PMD_RXQ_USAGE_RE.match(line)
+            if rxq:
+                interface = rxq.group(1)
+                queue_id = rxq.group(2)
+                usage = float(rxq.group(4))
+                rxq_usage[(numa, cpu, interface, queue_id)] = usage
+        return overhead, rxq_usage
+
+    def _pmd_rxq_and_live_output(self, hypervisor_ip):
+        """Fetch pmd-rxq-show and :9105 metrics in one SSH round-trip."""
+        cmd = (
+            'sudo ovs-appctl dpif-netdev/pmd-rxq-show 2>/dev/null; '
+            'curl -sk https://127.0.0.1:9105/metrics 2>/dev/null || '
+            'curl -s http://127.0.0.1:9105/metrics 2>/dev/null')
+        return self._ssh_run_on_hypervisor(hypervisor_ip, cmd, check_rc=False)
+
+    def _pmd_gauge_tolerance(self):
+        return CONF.nfv_plugin_options.network_exporter_pmd_gauge_tolerance
+
+    def _pmd_gauge_values_aligned(self, expected, reported):
+        return abs(expected - reported) <= self._pmd_gauge_tolerance()
+
+    def _pmd_rxq_label_key(self, labels):
+        return (
+            labels.get('numa'), labels.get('cpu'),
+            labels.get('interface'), labels.get('rxq'))
+
+    def _parse_prom_float_samples(self, metrics_output, metric_name,
+                                  required_labels=None):
+        """Parse Prometheus exposition text into float label/value samples."""
+        samples = []
+        for line in (metrics_output or '').splitlines():
+            match = PROM_METRIC_LINE_RE.match(line.strip())
+            if not match or match.group('metric') != metric_name:
+                continue
+            labels = dict(PROM_LABEL_RE.findall(match.group('labels')))
+            if required_labels and any(
+                    labels.get(key) != value
+                    for key, value in required_labels.items()):
+                continue
+            samples.append({
+                'labels': labels,
+                'value': float(match.group('value')),
+            })
+        return samples
+
+    def _hypervisors_with_pmd_rxq(self, hypervisors):
+        """Return hypervisors that export pmd-rxq-show stats."""
+        found = []
+        for hypervisor_ip in hypervisors:
+            try:
+                overhead, rxq_usage = self._ovs_pmd_rxq_stats(hypervisor_ip)
+                if overhead or rxq_usage:
+                    found.append(hypervisor_ip)
+            except Exception as exc:
+                LOG.warning(
+                    'No pmd-rxq-show on %s: %s', hypervisor_ip, exc)
+        return found
+
+    def _pmd_rxq_aligned_on_output(self, hypervisor_ip, metric_name, combined):
+        """Return True when live :9105 gauge matches pmd-rxq-show in output."""
+        overhead, rxq_usage = self._ovs_pmd_rxq_stats(
+            hypervisor_ip, output=combined)
+        live_samples = self._parse_prom_float_samples(combined, metric_name)
+        if not live_samples:
+            return False
+        if metric_name == OVS_PMD_CPU_OVERHEAD_METRIC:
+            if not overhead:
+                return False
+            live_by_key = {
+                self._pmd_thread_key(sample['labels']): sample['value']
+                for sample in live_samples}
+            for thread_key, expected in overhead.items():
+                reported = live_by_key.get(thread_key)
+                if reported is None:
+                    continue
+                if self._pmd_gauge_values_aligned(expected, reported):
+                    return True
+            return False
+        if metric_name == OVS_PMD_RXQ_USAGE_METRIC:
+            if not rxq_usage:
+                return False
+            live_by_key = {
+                self._pmd_rxq_label_key(sample['labels']): sample['value']
+                for sample in live_samples}
+            for rxq_key, expected in rxq_usage.items():
+                reported = live_by_key.get(rxq_key)
+                if reported is None:
+                    continue
+                if self._pmd_gauge_values_aligned(expected, reported):
+                    return True
+            return False
+        return False
+
+    def _assert_pmd_rxq_matches_show(self, hypervisor_ip, metric_name):
+        """Assert live :9105 ovs_pmd_* gauge matches pmd-rxq-show."""
+        last_exc = None
+        for attempt in range(METRIC_RETRY_ATTEMPTS):
+            combined = self._pmd_rxq_and_live_output(hypervisor_ip)
+            try:
+                if self._pmd_rxq_aligned_on_output(
+                        hypervisor_ip, metric_name, combined):
+                    LOG.warning(
+                        'PMD %s aligned with pmd-rxq-show on %s (attempt %s)',
+                        metric_name, hypervisor_ip, attempt + 1)
+                    return
+                self.fail(
+                    '%s on %s: no pmd-rxq-show series matched live :9105 '
+                    'within tolerance %s' % (
+                        metric_name, hypervisor_ip,
+                        self._pmd_gauge_tolerance()))
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'Attempt %s/%s waiting for PMD %s on %s: %s',
+                    attempt + 1, METRIC_RETRY_ATTEMPTS, metric_name,
+                    hypervisor_ip, exc)
+            if attempt < METRIC_RETRY_ATTEMPTS - 1:
+                time.sleep(METRIC_RETRY_INTERVAL)
+        if last_exc is not None:
+            raise last_exc
+        self.fail(
+            'Timed out waiting for PMD %s on %s to match pmd-rxq-show' % (
+                metric_name, hypervisor_ip))
+
+    def _assert_pmd_rxq_metric_reported(self, metric_name):
+        """Assert ovs_pmd_cpu_overhead/rxq_usage via show and pmd-rxq-show."""
+        self._assert_ovs_interface_metric_reported(metric_name)
+        hypervisors = self._get_ssh_hypervisors('')
+        self.assertNotEmpty(
+            hypervisors,
+            'No compute hypervisors available for PMD metric %s' % metric_name)
+        pmd_hypervisors = self._hypervisors_with_pmd_rxq(hypervisors)
+        self.assertNotEmpty(
+            pmd_hypervisors,
+            'No DPDK pmd-rxq-show output on hypervisors %s for %s' % (
+                hypervisors, metric_name))
+        last_exc = None
+        for hypervisor_ip in pmd_hypervisors:
+            try:
+                self._assert_pmd_rxq_matches_show(
+                    hypervisor_ip, metric_name)
+                return
+            except Exception as exc:
+                last_exc = exc
+                LOG.warning(
+                    'PMD rxq-show check failed on %s for %s: %s',
+                    hypervisor_ip, metric_name, exc)
+        self.fail(
+            'PMD metric %s did not match pmd-rxq-show on any hypervisor %s; '
+            'last error: %s' % (metric_name, pmd_hypervisors, last_exc))
+
+    def _max_rxq_usage_percent(self, hypervisor_ip, output=None):
+        """Return peak RxQ usage percent from pmd-rxq-show and live :9105."""
+        if output is None:
+            output = self._pmd_rxq_and_live_output(hypervisor_ip)
+        _overhead, rxq_usage = self._ovs_pmd_rxq_stats(
+            hypervisor_ip, output=output)
+        live_samples = self._parse_prom_float_samples(
+            output, OVS_PMD_RXQ_USAGE_METRIC)
+        values = list(rxq_usage.values())
+        values.extend(sample['value'] for sample in live_samples)
+        return max(values) if values else 0.0
 
     def _assert_metric_on_compute_scrape(self, metric_name):
         """Verify metric_name is exported on at least one compute :9105 scrape."""
