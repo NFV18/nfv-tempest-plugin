@@ -1151,9 +1151,10 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             'Could not get pmd-perf-show on %s (last output: %r)' % (
                 hypervisor_ip, (last_output or '')[:500]))
 
-    def _ovs_pmd_perf_stats_map(self, hypervisor_ip):
+    def _ovs_pmd_perf_stats_map(self, hypervisor_ip, output=None):
         """Map (numa, cpu) -> pmd-perf-show stat name -> value."""
-        output = self._pmd_perf_show_output(hypervisor_ip)
+        if output is None:
+            output = self._pmd_perf_show_output(hypervisor_ip)
         result = {}
         numa = cpu = None
         for line in output.splitlines():
@@ -1169,13 +1170,35 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 result[(numa, cpu)][stat.group(1).strip()] = int(stat.group(2))
         return result
 
+    def _pmd_perf_and_live_output(self, hypervisor_ip):
+        """Fetch pmd-perf-show and :9105 metrics in one SSH round-trip."""
+        cmd = (
+            'sudo ovs-appctl dpif-netdev/pmd-perf-show 2>/dev/null; '
+            'curl -sk https://127.0.0.1:9105/metrics 2>/dev/null || '
+            'curl -s http://127.0.0.1:9105/metrics 2>/dev/null')
+        return self._ssh_run_on_hypervisor(hypervisor_ip, cmd, check_rc=False)
+
+    def _pmd_alignment_allowed_delta(self, expected, reported):
+        pct = CONF.nfv_plugin_options.network_exporter_pmd_alignment_tolerance_pct
+        floor = CONF.nfv_plugin_options.network_exporter_pmd_alignment_min_delta
+        largest = max(abs(expected), abs(reported), 1)
+        return max(floor, int(largest * pct / 100.0))
+
+    def _pmd_values_aligned(self, expected, reported):
+        """PMD counters advance between perf-show and exporter reads."""
+        if expected == reported:
+            return True
+        return abs(expected - reported) <= self._pmd_alignment_allowed_delta(
+            expected, reported)
+
     def _pmd_thread_key(self, labels):
         return labels.get('numa'), labels.get('cpu')
 
-    def _pmd_live_samples(self, hypervisor_ip, metric_name):
+    def _pmd_live_samples(self, hypervisor_ip, metric_name, metrics_output=None):
         """Return all ovs_pmd_* samples from live :9105 on one hypervisor."""
-        return self._parse_prom_samples(
-            self._scrape_compute_metrics_text(hypervisor_ip), metric_name)
+        if metrics_output is None:
+            metrics_output = self._scrape_compute_metrics_text(hypervisor_ip)
+        return self._parse_prom_samples(metrics_output, metric_name)
 
     def _pmd_live_total(self, hypervisor_ip, metric_name):
         """Sum ovs_pmd_* across all PMD threads on one hypervisor."""
@@ -1211,10 +1234,13 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             stat_name, 'No pmd-perf-show mapping for metric %s' % metric_name)
         last_exc = None
         for attempt in range(METRIC_RETRY_ATTEMPTS):
-            perf_map = self._ovs_pmd_perf_stats_map(hypervisor_ip)
+            combined = self._pmd_perf_and_live_output(hypervisor_ip)
+            perf_map = self._ovs_pmd_perf_stats_map(
+                hypervisor_ip, output=combined)
             live_by_key = {
                 self._pmd_thread_key(sample['labels']): sample['value']
-                for sample in self._pmd_live_samples(hypervisor_ip, metric_name)
+                for sample in self._pmd_live_samples(
+                    hypervisor_ip, metric_name, metrics_output=combined)
             }
             try:
                 self.assertNotEmpty(
@@ -1224,7 +1250,6 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     live_by_key,
                     '%s missing on live :9105 on %s' % (
                         metric_name, hypervisor_ip))
-                matched = False
                 for thread_key, stats in perf_map.items():
                     if stat_name not in stats:
                         continue
@@ -1232,17 +1257,21 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     reported = live_by_key.get(thread_key)
                     if reported is None:
                         continue
-                    self.assertEqual(
-                        expected, reported,
-                        '%s on %s numa=%s cpu=%s: perf-show %s=%s live=%s' % (
+                    allowed = self._pmd_alignment_allowed_delta(
+                        expected, reported)
+                    self.assertTrue(
+                        self._pmd_values_aligned(expected, reported),
+                        '%s on %s numa=%s cpu=%s: perf-show %s=%s live=%s '
+                        '(delta %s, allowed %s)' % (
                             metric_name, hypervisor_ip, thread_key[0],
-                            thread_key[1], stat_name, expected, reported))
-                    matched = True
+                            thread_key[1], stat_name, expected, reported,
+                            abs(expected - reported), allowed))
                     LOG.warning(
                         'PMD %s aligned with pmd-perf-show on %s numa=%s '
-                        'cpu=%s (attempt %s): %s',
+                        'cpu=%s (attempt %s): perf=%s live=%s delta=%s',
                         metric_name, hypervisor_ip, thread_key[0],
-                        thread_key[1], attempt + 1, expected)
+                        thread_key[1], attempt + 1, expected, reported,
+                        abs(expected - reported))
                     return
                 self.fail(
                     '%s on %s: no pmd-perf-show thread matched live :9105 '

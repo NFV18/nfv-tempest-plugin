@@ -172,6 +172,14 @@ NfvPluginOptions = [
                help='Minimum summed ovs_pmd_rx/tx_packets increase after VM '
                     'traffic. 0 scales from network_exporter_traffic_ping_count '
                     'and packet tolerance.'),
+    cfg.FloatOpt('network_exporter_pmd_alignment_tolerance_pct',
+                 default=0.01,
+                 help='Allowed percent drift between pmd-perf-show and live '
+                      ':9105 when counters advance between reads.'),
+    cfg.IntOpt('network_exporter_pmd_alignment_min_delta',
+               default=5000000,
+               help='Minimum allowed absolute drift between sequential PMD '
+                    'perf-show and exporter reads.'),
     cfg.IntOpt('network_exporter_error_udp_flood_packets',
                default=50000,
                help='UDP datagrams sent at high rate to a peer dataplane IP '
