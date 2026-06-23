@@ -1214,11 +1214,13 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             metrics_output = self._scrape_compute_metrics_text(hypervisor_ip)
         return self._parse_prom_samples(metrics_output, metric_name)
 
-    def _pmd_live_total(self, hypervisor_ip, metric_name):
+    def _pmd_live_total(self, hypervisor_ip, metric_name,
+                        metrics_output=None):
         """Sum ovs_pmd_* across all PMD threads on one hypervisor."""
         return sum(
             sample['value']
-            for sample in self._pmd_live_samples(hypervisor_ip, metric_name))
+            for sample in self._pmd_live_samples(
+                hypervisor_ip, metric_name, metrics_output=metrics_output))
 
     def _pmd_perf_total(self, hypervisor_ip, metric_name):
         """Sum one pmd-perf-show stat across all PMD threads."""
@@ -1527,6 +1529,35 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         values = list(rxq_usage.values())
         values.extend(sample['value'] for sample in live_samples)
         return max(values) if values else 0.0
+
+    def _pmd_min_packet_threshold(self):
+        configured = CONF.nfv_plugin_options.network_exporter_pmd_min_packets
+        if configured:
+            return configured
+        count = CONF.nfv_plugin_options.network_exporter_traffic_ping_count
+        tolerance = (
+            CONF.nfv_plugin_options.network_exporter_traffic_packet_tolerance_pct)
+        return int(count * (100 - tolerance) / 100)
+
+    def _pmd_perf_activity_totals(self, hypervisor_ip):
+        """Summed PMD perf counters used as traffic-activity fallback."""
+        return {
+            'busy': self._pmd_perf_total(
+                hypervisor_ip, OVS_PMD_BUSY_ITERATIONS_METRIC),
+            'rx': self._pmd_perf_total(
+                hypervisor_ip, OVS_PMD_RX_PACKETS_METRIC),
+        }
+
+    def _pmd_live_activity_totals(self, hypervisor_ip, metrics_output=None):
+        """Summed live :9105 PMD counters for traffic-activity fallback."""
+        return {
+            'busy': self._pmd_live_total(
+                hypervisor_ip, OVS_PMD_BUSY_ITERATIONS_METRIC,
+                metrics_output=metrics_output),
+            'rx': self._pmd_live_total(
+                hypervisor_ip, OVS_PMD_RX_PACKETS_METRIC,
+                metrics_output=metrics_output),
+        }
 
     def _assert_metric_on_compute_scrape(self, metric_name):
         """Verify metric_name is exported on at least one compute :9105 scrape."""

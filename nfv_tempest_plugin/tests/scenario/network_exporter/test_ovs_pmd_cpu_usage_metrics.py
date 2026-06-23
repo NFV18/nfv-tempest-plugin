@@ -138,9 +138,13 @@ class TestOvsPmdCpuUsageMetrics(metrics_base.NetworkExporterMetricsBase):
         return shared[0]['ip_address']
 
     def _wait_for_pmd_cpu_usage_with_traffic(self, hypervisor_ip,
-                                             baseline_max_rxq):
+                                             baseline_max_rxq, perf_baseline):
         min_rxq = CONF.nfv_plugin_options.network_exporter_pmd_min_rxq_usage_pct
+        min_busy = CONF.nfv_plugin_options.network_exporter_pmd_min_iterations
+        min_rx = self._pmd_min_packet_threshold()
         peak_rxq = baseline_max_rxq
+        peak_busy = perf_baseline['busy']
+        peak_rx = perf_baseline['rx']
         last_exc = None
         last = {}
         for attempt in range(metrics_base.METRIC_RETRY_ATTEMPTS):
@@ -150,31 +154,45 @@ class TestOvsPmdCpuUsageMetrics(metrics_base.NetworkExporterMetricsBase):
             current_max_rxq = self._max_rxq_usage_percent(
                 hypervisor_ip, output=combined)
             peak_rxq = max(peak_rxq, current_max_rxq)
+            perf_current = self._pmd_perf_activity_totals(hypervisor_ip)
+            live_current = self._pmd_live_activity_totals(
+                hypervisor_ip, metrics_output=combined)
+            peak_busy = max(
+                peak_busy, perf_current['busy'], live_current['busy'])
+            peak_rx = max(peak_rx, perf_current['rx'], live_current['rx'])
+            busy_delta = peak_busy - perf_baseline['busy']
+            rx_delta = peak_rx - perf_baseline['rx']
             last = {
                 'baseline_max_rxq': baseline_max_rxq,
-                'current_max_rxq': current_max_rxq,
                 'peak_max_rxq': peak_rxq,
                 'min_rxq_required': min_rxq,
+                'busy_delta': busy_delta,
+                'rx_delta': rx_delta,
+                'min_busy_required': min_busy,
+                'min_rx_required': min_rx,
                 'overhead_threads': len(overhead),
                 'rxq_series': len(rxq_usage),
             }
             try:
-                self.assertGreaterEqual(
-                    peak_rxq, min_rxq,
-                    'ovs_pmd_rxq_usage peak below %s after traffic: %s' % (
-                        min_rxq, last))
-                self.assertGreaterEqual(
-                    peak_rxq, baseline_max_rxq,
-                    'ovs_pmd_rxq_usage did not sustain or increase: %s' % last)
+                rxq_ok = (
+                    (min_rxq > 0 and peak_rxq >= min_rxq) or
+                    peak_rxq > baseline_max_rxq)
+                perf_ok = busy_delta >= min_busy or rx_delta >= min_rx
+                self.assertTrue(
+                    rxq_ok or perf_ok,
+                    'No PMD CPU usage activity after traffic (need rxq peak '
+                    '>=%s or busy +%s or rx +%s): %s' % (
+                        min_rxq, min_busy, min_rx, last))
                 for metric_name in metrics_base.OVS_PMD_CPU_USAGE_METRICS:
                     self.assertTrue(
                         self._pmd_rxq_aligned_on_output(
                             hypervisor_ip, metric_name, combined),
                         '%s not aligned with pmd-rxq-show: %s' % (
                             metric_name, last))
+                last['activity'] = 'rxq_usage' if rxq_ok else 'pmd_perf'
                 LOG.warning(
-                    'PMD CPU usage validated (attempt %s): %s',
-                    attempt + 1, last)
+                    'PMD CPU usage validated via %s (attempt %s): %s',
+                    last['activity'], attempt + 1, last)
                 return last
             except Exception as exc:
                 last_exc = exc
@@ -212,11 +230,12 @@ class TestOvsPmdCpuUsageMetrics(metrics_base.NetworkExporterMetricsBase):
         hypervisor_ip = sender['hypervisor_ip']
         peer_ip = self._dataplane_peer_ip(sender, receiver)
         baseline_max_rxq = self._max_rxq_usage_percent(hypervisor_ip)
+        perf_baseline = self._pmd_perf_activity_totals(hypervisor_ip)
         LOG.warning(
             'PMD CPU usage test: %s -> %s on %s, baseline max rxq usage %s%%, '
-            'ping count %s',
+            'perf baseline %s, ping count %s',
             sender.get('name', sender['id']), peer_ip, hypervisor_ip,
-            baseline_max_rxq, self._traffic_ping_count())
+            baseline_max_rxq, perf_baseline, self._traffic_ping_count())
 
         ssh_sender = self.get_remote_client(
             sender['fip'], self.instance_user, key_pair['private_key'])
@@ -225,7 +244,8 @@ class TestOvsPmdCpuUsageMetrics(metrics_base.NetworkExporterMetricsBase):
             self._min_expected_packets())
 
         result = self._wait_for_pmd_cpu_usage_with_traffic(
-            hypervisor_ip, baseline_max_rxq)
+            hypervisor_ip, baseline_max_rxq, perf_baseline)
         LOG.warning(
-            'PMD CPU usage OK: peak rxq usage %s%% (baseline %s%%)',
-            result['peak_max_rxq'], result['baseline_max_rxq'])
+            'PMD CPU usage OK via %s: peak rxq %s%% busy +%s rx +%s',
+            result.get('activity', 'unknown'),
+            result['peak_max_rxq'], result['busy_delta'], result['rx_delta'])

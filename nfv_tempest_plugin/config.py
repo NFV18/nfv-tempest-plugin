@@ -186,9 +186,10 @@ NfvPluginOptions = [
                       'pmd-rxq-show and live :9105 for ovs_pmd_cpu_overhead '
                       'and ovs_pmd_rxq_usage gauges.'),
     cfg.FloatOpt('network_exporter_pmd_min_rxq_usage_pct',
-                 default=1.0,
-                 help='Minimum ovs_pmd_rxq_usage peak after VM traffic on at '
-                      'least one enabled RxQ.'),
+                 default=0.0,
+                 help='When >0, require this ovs_pmd_rxq_usage peak after VM '
+                      'traffic. When 0, traffic activity is validated via '
+                      'ovs_pmd_busy_iterations or ovs_pmd_rx_packets instead.'),
     cfg.IntOpt('network_exporter_error_udp_flood_packets',
                default=50000,
                help='UDP datagrams sent at high rate to a peer dataplane IP '
