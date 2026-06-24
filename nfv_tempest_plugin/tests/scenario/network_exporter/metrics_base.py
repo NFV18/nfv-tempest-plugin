@@ -13,17 +13,25 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import os
 import re
 import time
 import unittest
 
 import paramiko
-from kubernetes.client.rest import ApiException
+import requests
+import urllib3
 from tempest import config
 
-from nfv_tempest_plugin.tests.common import k8s
 from nfv_tempest_plugin.tests.scenario import base_test
 from oslo_log import log as logging
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+PROMETHEUS_HOST = os.environ.get(
+    'PROMETHEUS_HOST', 'metric-storage-prometheus.openstack.svc')
+PROMETHEUS_PORT = os.environ.get('PROMETHEUS_PORT', '9090')
+PROMETHEUS_CA_CERT = os.environ.get('PROMETHEUS_CA_CERT', '')
 
 CONF = config.CONF
 LOG = logging.getLogger('{} [-] nfv_plugin_test'.format(__name__))
@@ -70,24 +78,61 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
 
     def __init__(self, *args, **kwargs):
         super(NetworkExporterMetricsBase, self).__init__(*args, **kwargs)
-        self.k8s_client = k8s.openshift_client()
         self._hypervisor_id_cache = {}
+        self._prometheus_verify = PROMETHEUS_CA_CERT if PROMETHEUS_CA_CERT else False
+        self._prometheus_url = 'https://%s:%s/api/v1/query' % (
+            PROMETHEUS_HOST, PROMETHEUS_PORT)
+
+    @staticmethod
+    def _prometheus_results_to_table(results):
+        """Format Prometheus query results as a pipe-delimited table."""
+        if not results:
+            return ''
+        all_labels = []
+        seen = set()
+        for r in results:
+            for key in r['metric']:
+                if key not in seen:
+                    all_labels.append(key)
+                    seen.add(key)
+        cols = all_labels + ['value']
+        widths = [len(c) for c in cols]
+        rows = []
+        for r in results:
+            row = [str(r['metric'].get(c, '')) for c in all_labels]
+            row.append(str(r['value'][1]))
+            rows.append(row)
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+        sep = '+' + '+'.join('-' * (w + 2) for w in widths) + '+'
+        header = '| ' + ' | '.join(
+            c.ljust(w) for c, w in zip(cols, widths)) + ' |'
+        lines = [sep, header, sep]
+        for row in rows:
+            lines.append('| ' + ' | '.join(
+                c.ljust(w) for c, w in zip(row, widths)) + ' |')
+        lines.append(sep)
+        return '\n'.join(lines) + '\n'
 
     def _metric_show(self, metric_name):
-        """Run openstack metric show in the openstackclient pod."""
-        cmd = 'openstack metric show %s --disable-rbac' % metric_name
-        LOG.info("Executing in pod %s/%s: %s",
-                 OPENSTACK_NAMESPACE, OPENSTACK_CLIENT_POD, cmd)
+        """Query Prometheus directly for metric values."""
+        query = 'last_over_time(%s[5m])' % metric_name
+        LOG.info("Querying Prometheus: %s", query)
         try:
-            stdout = self.k8s_client.execute_command_in_pod(
-                OPENSTACK_CLIENT_POD, OPENSTACK_NAMESPACE,
-                OPENSTACK_CLIENT_CONTAINER, cmd)
-            return stdout or '', '', 0
-        except ApiException as exc:
-            msg = 'kubernetes API %s: %s' % (exc.status, exc.body or exc.reason)
-            LOG.warning("Pod exec API error: %s", msg)
-            return '', msg, 1
+            resp = requests.get(
+                self._prometheus_url, params={'query': query},
+                verify=self._prometheus_verify, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get('status') != 'success':
+                msg = data.get('error', 'unknown error')
+                LOG.warning("Prometheus query failed: %s", msg)
+                return '', msg, 1
+            results = data.get('data', {}).get('result', [])
+            stdout = self._prometheus_results_to_table(results)
+            return stdout, '', 0
         except Exception as exc:
+            LOG.warning("Prometheus query error: %s", exc)
             return '', str(exc), 1
 
     def _assert_metric_reported(self, metric_name, output_markers=None):
