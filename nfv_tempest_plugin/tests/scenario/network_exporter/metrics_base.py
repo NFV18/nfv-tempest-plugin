@@ -13,17 +13,26 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import os
 import re
 import time
 import unittest
 
 import paramiko
-from kubernetes.client.rest import ApiException
+import requests
+import urllib3
 from tempest import config
 
-from nfv_tempest_plugin.tests.common import k8s
 from nfv_tempest_plugin.tests.scenario import base_test
 from oslo_log import log as logging
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+PROMETHEUS_HOST = os.environ.get(
+    'PROMETHEUS_HOST', 'metric-storage-prometheus.openstack.svc')
+PROMETHEUS_PORT = os.environ.get('PROMETHEUS_PORT', '9090')
+PROMETHEUS_CA_CERT = os.environ.get('PROMETHEUS_CA_CERT', '')
+PROMETHEUS_SCHEME = os.environ.get('PROMETHEUS_SCHEME', '')
 
 CONF = config.CONF
 LOG = logging.getLogger('{} [-] nfv_plugin_test'.format(__name__))
@@ -48,9 +57,6 @@ OVN_NORTHD_STATUS_ACTIVE = 1
 # openstack-network-exporter: admin/link up=1, down=0; link unknown=-1
 OVS_STATE_UP = 1
 OVS_STATE_DOWN = 0
-OPENSTACK_NAMESPACE = 'openstack'
-OPENSTACK_CLIENT_POD = 'openstackclient'
-OPENSTACK_CLIENT_CONTAINER = 'openstackclient'
 NETWORK_EXPORTER_INSTANCE_PORT = ':9105'
 FLOW_COUNT_RE = re.compile(r'flow_count=(\d+)', re.IGNORECASE)
 METRIC_ROW_VALUE_RE = re.compile(r'(\d+)\s*\|?\s*$')
@@ -70,28 +76,90 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
 
     def __init__(self, *args, **kwargs):
         super(NetworkExporterMetricsBase, self).__init__(*args, **kwargs)
-        self.k8s_client = k8s.openshift_client()
         self._hypervisor_id_cache = {}
+        self._prometheus_https_verify = (
+            PROMETHEUS_CA_CERT if PROMETHEUS_CA_CERT else False)
+        self._prometheus_query_urls = self._prometheus_query_url_candidates()
+
+    @staticmethod
+    def _prometheus_query_url_candidates():
+        """Return metric-storage query URLs; HTTP first unless scheme is set."""
+        base = '%s:%s/api/v1/query' % (PROMETHEUS_HOST, PROMETHEUS_PORT)
+        if PROMETHEUS_SCHEME:
+            return ['%s://%s' % (PROMETHEUS_SCHEME, base)]
+        return ['http://%s' % base, 'https://%s' % base]
+
+    @staticmethod
+    def _prometheus_results_to_table(results):
+        """Format Prometheus query results as a pipe-delimited table."""
+        if not results:
+            return ''
+        all_labels = []
+        seen = set()
+        for result in results:
+            for key in result['metric']:
+                if key not in seen:
+                    all_labels.append(key)
+                    seen.add(key)
+        cols = all_labels + ['value']
+        widths = [len(column) for column in cols]
+        rows = []
+        for result in results:
+            row = [str(result['metric'].get(column, ''))
+                   for column in all_labels]
+            row.append(str(result['value'][1]))
+            rows.append(row)
+            for index, cell in enumerate(row):
+                widths[index] = max(widths[index], len(cell))
+        separator = '+' + '+'.join('-' * (width + 2) for width in widths) + '+'
+        header = '| ' + ' | '.join(
+            column.ljust(width) for column, width in zip(cols, widths)) + ' |'
+        lines = [separator, header, separator]
+        for row in rows:
+            lines.append('| ' + ' | '.join(
+                cell.ljust(width) for cell, width in zip(row, widths)) + ' |')
+            lines.append(separator)
+        return '\n'.join(lines) + '\n'
+
+    def _query_prometheus(self, query):
+        """Query metric-storage Prometheus; try HTTP then HTTPS by default."""
+        errors = []
+        for url in self._prometheus_query_urls:
+            verify = (self._prometheus_https_verify
+                      if url.startswith('https://') else True)
+            try:
+                resp = requests.get(
+                    url, params={'query': query}, verify=verify, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                errors.append('%s: %s' % (url, exc))
+                continue
+            if data.get('status') != 'success':
+                errors.append('%s: %s' % (
+                    url, data.get('error', 'unknown error')))
+                continue
+            return data.get('data', {}).get('result', []), ''
+        return None, '; '.join(errors) or 'Prometheus query failed'
 
     def _metric_show(self, metric_name):
-        """Run openstack metric show in the openstackclient pod."""
-        cmd = 'openstack metric show %s --disable-rbac' % metric_name
-        LOG.info("Executing in pod %s/%s: %s",
-                 OPENSTACK_NAMESPACE, OPENSTACK_CLIENT_POD, cmd)
+        """Query metric-storage Prometheus for metric values."""
+        query = 'last_over_time(%s[5m])' % metric_name
+        LOG.info("Querying Prometheus (%s): %s",
+                 self._prometheus_query_urls[0], query)
         try:
-            stdout = self.k8s_client.execute_command_in_pod(
-                OPENSTACK_CLIENT_POD, OPENSTACK_NAMESPACE,
-                OPENSTACK_CLIENT_CONTAINER, cmd)
-            return stdout or '', '', 0
-        except ApiException as exc:
-            msg = 'kubernetes API %s: %s' % (exc.status, exc.body or exc.reason)
-            LOG.warning("Pod exec API error: %s", msg)
-            return '', msg, 1
+            results, error = self._query_prometheus(query)
+            if results is None:
+                LOG.warning("Prometheus query failed: %s", error)
+                return '', error, 1
+            stdout = self._prometheus_results_to_table(results)
+            return stdout, '', 0
         except Exception as exc:
+            LOG.warning("Prometheus query error: %s", exc)
             return '', str(exc), 1
 
     def _assert_metric_reported(self, metric_name, output_markers=None):
-        """Wait until openstack metric show succeeds for metric_name."""
+        """Wait until metric_name is present in metric-storage Prometheus."""
         if output_markers is None:
             output_markers = [metric_name]
         stdout = stderr = ''
@@ -103,7 +171,7 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                 missing = [m for m in output_markers if m not in stdout]
                 if not missing:
                     self.assertTrue(stdout.strip(),
-                                    'openstack metric show returned empty '
+                                    'metric-storage Prometheus returned empty '
                                     'output for %s' % metric_name)
                     LOG.info("Metric '%s' is reported (%s bytes)",
                                 metric_name, len(stdout))
@@ -114,12 +182,12 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             if attempt < METRIC_RETRY_ATTEMPTS - 1:
                 time.sleep(METRIC_RETRY_INTERVAL)
         stdout = stdout or ''
-        msg = ("Metric '%s' not found or openstack command failed "
-               "(exit %s). stderr: %s stdout: %s" %
+        msg = ("Metric '%s' not found or metric-storage Prometheus query "
+               "failed (exit %s). stderr: %s stdout: %s" %
                (metric_name, returncode, stderr, stdout))
         self.assertEqual(0, returncode, msg)
         self.assertIn(metric_name, stdout,
-                      "Metric '%s' not present in command output. stdout: %s"
+                      "Metric '%s' not present in Prometheus output. stdout: %s"
                       % (metric_name, stdout))
         missing = [m for m in output_markers if m not in stdout]
         self.assertFalse(
