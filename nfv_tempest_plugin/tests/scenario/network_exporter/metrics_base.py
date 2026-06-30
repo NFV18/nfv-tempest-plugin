@@ -397,11 +397,6 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         return samples, error
 
     def _metric_show_output_usable(self, metric_name, stdout):
-        """True when pod exec or PromQL output contains metric_name samples."""
-        stdout = stdout or ''
-        return bool(stdout.strip()) and metric_name in stdout
-
-    def _metric_show_output_usable(self, metric_name, stdout):
         """True when PromQL output contains metric_name samples."""
         stdout = stdout or ''
         return bool(stdout.strip()) and metric_name in stdout
