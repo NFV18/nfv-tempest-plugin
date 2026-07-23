@@ -498,6 +498,12 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
             for net in nets:
                 if not net['router:external'] \
                         and 'HA network tenant' not in net['name']:
+                    if not net.get('subnets'):
+                        LOG.warning(
+                            'Skipping network %s (%s) with no subnets when '
+                            'adding router interfaces',
+                            net.get('name'), net.get('id'))
+                        continue
                     subnets.append(net['subnets'][0])
         else:
             subnets.append(mgmt_net['subnet-id'])
