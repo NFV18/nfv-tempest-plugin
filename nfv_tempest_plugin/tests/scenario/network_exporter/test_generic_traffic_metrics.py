@@ -208,7 +208,10 @@ class TestGenericTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
         if len(samples) > 1:
             self.fail(
                 '%s in metric-storage on %s matched multiple series for '
-                'interface %s' % (metric_name, hypervisor_ip, interface))
+                'interface %s: %s' % (
+                    metric_name, hypervisor_ip, interface,
+                    [s['labels'].get('instance', s['labels'])
+                     for s in samples]))
         return samples[0]['value']
 
     def _assert_counters_match_ovs(self, hypervisor_ip, interface, ovs_stats):

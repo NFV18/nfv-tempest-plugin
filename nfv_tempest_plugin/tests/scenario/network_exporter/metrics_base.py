@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import ipaddress
 import os
 import re
 import time
@@ -363,15 +364,47 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             return results, ''
         return [], error or 'metric-storage query failed'
 
+    @staticmethod
+    def _is_ip_literal(value):
+        """True when value is a bare IPv4/IPv6 address (not a hostname)."""
+        try:
+            ipaddress.ip_address(value)
+            return True
+        except ValueError:
+            return False
+
+    def _text_matches_hypervisor_identifier(self, text, ident):
+        """Match a hypervisor identifier against label/row text.
+
+        Do not derive short forms from IP addresses (e.g. 192.168.122.101
+        must not use '192' as a substring match — that collides with every
+        other 192.x compute). Hostname short forms require a token boundary
+        so 'compute-0' does not match 'compute-01'.
+        """
+        if not text or not ident:
+            return False
+        if self._is_ip_literal(ident):
+            # Match bare IP or Prometheus instance form IP:port. Never use the
+            # first dotted octet as a short form (that matches every 192.x host).
+            return bool(re.search(
+                r'(^|[^0-9.])%s(:\d+)?(?=[^0-9.]|$)' % re.escape(ident),
+                text))
+        if ident in text:
+            return True
+        short = ident.split('.')[0]
+        if not short or short == ident:
+            return False
+        return bool(re.search(
+            r'(^|[^A-Za-z0-9-])%s([^A-Za-z0-9-]|$)' % re.escape(short),
+            text))
+
     def _sample_matches_hypervisor(self, labels, hypervisor_ip):
         """True when a metric-storage sample belongs to hypervisor_ip."""
         row_text = ' '.join(
             labels.get(key, '') for key in ('instance', 'fqdn', 'hostname'))
-        for ident in self._hypervisor_identifiers(hypervisor_ip):
-            ident_short = ident.split('.')[0]
-            if ident in row_text or ident_short in row_text:
-                return True
-        return False
+        return any(
+            self._text_matches_hypervisor_identifier(row_text, ident)
+            for ident in self._hypervisor_identifiers(hypervisor_ip))
 
     def _metric_storage_samples(self, metric_name, hypervisor_ip=None,
                                 required_labels=None):
@@ -449,9 +482,16 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
                     continue
                 node_short = node.split('.')[0]
                 for ident in self._hypervisor_identifiers(hypervisor_ip):
+                    if self._is_ip_literal(ident):
+                        # nodeName is normally a hostname; only match exact IP.
+                        if ident == node:
+                            pod_name = pod['metadata']['name']
+                            pod_obj = pod
+                            break
+                        continue
                     ident_short = ident.split('.')[0]
-                    if (ident in node or node in ident or
-                            ident_short == node_short):
+                    if (ident == node or ident in node or node in ident or
+                            (ident_short and ident_short == node_short)):
                         pod_name = pod['metadata']['name']
                         pod_obj = pod
                         break
@@ -2299,12 +2339,14 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         if not self._row_is_compute_network_exporter(parts):
             return False
         row_text = ' '.join(parts)
-        return any(identifier in row_text
-                   for identifier in self._hypervisor_identifiers(hypervisor_ip))
+        return any(
+            self._text_matches_hypervisor_identifier(row_text, identifier)
+            for identifier in self._hypervisor_identifiers(hypervisor_ip))
 
     def _line_matches_hypervisor(self, line, hypervisor_ip):
-        return any(identifier in line
-                   for identifier in self._hypervisor_identifiers(hypervisor_ip))
+        return any(
+            self._text_matches_hypervisor_identifier(line, identifier)
+            for identifier in self._hypervisor_identifiers(hypervisor_ip))
 
     def _is_ovn_k8s_metrics_row(self, line):
         """True for OVN metrics scraped via openstack.svc:1981 (not compute)."""
