@@ -243,7 +243,10 @@ class NetVfMetricsMixin(object):
         if len(samples) > 1:
             self.fail(
                 '%s in metric-storage on %s matched multiple VF series for '
-                'labels %s' % (metric_name, hypervisor_ip, identity))
+                'labels %s: %s' % (
+                    metric_name, hypervisor_ip, identity,
+                    [s['labels'].get('instance', s['labels'])
+                     for s in samples]))
         return samples[0]['value']
 
     def _vf_promql_filter(self, hypervisor_ip, vf_labels, metric_name):
