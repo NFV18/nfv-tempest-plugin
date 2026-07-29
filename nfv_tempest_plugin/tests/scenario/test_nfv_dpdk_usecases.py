@@ -191,7 +191,7 @@ class TestDpdkScenarios(base_test.BaseTest, QoSManagerMixin):
 
         check_section = 'libvirt'
         check_value = 'rx_queue_size,tx_queue_size'
-        config_path = CONF.nfv_plugin_options.conf_files['nova']
+        config_path = CONF.nfv_plugin_options.conf_files['cpu_pinning_nova']
 
         for srv in servers:
             LOG.info('Test RX/TX for the {} instance'.format(srv['fip']))
