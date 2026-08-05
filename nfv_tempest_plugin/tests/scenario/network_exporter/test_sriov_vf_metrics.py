@@ -15,6 +15,7 @@
 #    under the License.
 
 import base64
+import shlex
 import time
 import unittest
 
@@ -271,16 +272,77 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
     def _set_hypervisor_vf_link_state(self, hypervisor_ip, vf_labels, enabled):
         """Enable or disable SR-IOV VF link state from the compute hypervisor."""
         state = 'enable' if enabled else 'disable'
+        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
         cmd = 'sudo ip link set dev %s vf %s state %s' % (
-            vf_labels['device'], vf_labels['vf'], state)
+            pf_netdev, vf_labels['vf'], state)
         self._ssh_run_on_hypervisor(hypervisor_ip, cmd)
 
     def _restore_hypervisor_vf_link(self, hypervisor_ip, vf_labels):
         """Best-effort re-enable of VF link state after transmit drop test."""
+        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
         self._ssh_run_unchecked_on_hypervisor(
             hypervisor_ip,
             'sudo ip link set dev %s vf %s state enable' % (
-                vf_labels['device'], vf_labels['vf']))
+                pf_netdev, vf_labels['vf']))
+
+    def _hypervisor_vf_link_state(self, hypervisor_ip, vf_labels):
+        """Return VF link-state string from ``ip link`` (enable/disable/auto)."""
+        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
+        script = (
+            'PF=%s VF=%s python3 - <<\'PY\'\n'
+            'import os, re, subprocess\n'
+            'pf = os.environ["PF"]\n'
+            'vf = os.environ["VF"]\n'
+            'try:\n'
+            '    out = subprocess.check_output(\n'
+            '        ["ip", "-s", "link", "show", "dev", pf],\n'
+            '        text=True, stderr=subprocess.DEVNULL)\n'
+            'except Exception:\n'
+            '    raise SystemExit(0)\n'
+            'for part in re.split(r"(?m)(?=^\\s*vf\\s+\\d+)", out):\n'
+            '    m = re.match(r"\\s*vf\\s+(\\d+)\\b", part)\n'
+            '    if not m or m.group(1) != vf:\n'
+            '        continue\n'
+            '    m2 = re.search(r"link-state\\s+(\\w+)", part)\n'
+            '    if m2:\n'
+            '        print(m2.group(1))\n'
+            '    break\n'
+            'PY' % (
+                shlex.quote(pf_netdev),
+                shlex.quote(str(vf_labels['vf']))))
+        lines = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip, script).strip().splitlines()
+        return lines[-1].strip() if lines else ''
+
+    def _set_guest_dataplane_iface_state(self, ssh_client, mac_address, up):
+        """Bring the guest SR-IOV dataplane iface up or down (needs sudo)."""
+        sudo = self._guest_sudo_prefix(ssh_client)
+        if not sudo:
+            raise unittest.SkipTest(
+                'Passwordless sudo required on the guest to toggle the '
+                'SR-IOV dataplane interface for drop induction')
+        iface = self._guest_dataplane_iface(ssh_client, mac_address)
+        state = 'up' if up else 'down'
+        ssh_client.exec_command('%s ip link set dev %s %s' % (
+            sudo, iface, state))
+        return iface
+
+    def _restore_guest_dataplane_iface(self, ssh_client, mac_address):
+        """Best-effort bring-up of the guest SR-IOV dataplane iface."""
+        try:
+            sudo = self._guest_sudo_prefix(ssh_client)
+            if not sudo:
+                return
+            iface = self._lookup_guest_dataplane_iface_by_mac(
+                ssh_client, mac_address)
+            if not iface:
+                return
+            ssh_client.exec_command(
+                '%s ip link set dev %s up' % (sudo, iface))
+        except Exception as exc:
+            LOG.warning(
+                'Failed to restore guest dataplane iface for MAC %s: %s',
+                mac_address, exc)
 
     def _induce_transmit_drops(self, ctx, count, min_packets):
         """Disable host VF link and flood TX from guest (iface stays up)."""
@@ -300,21 +362,29 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         self._set_hypervisor_vf_link_state(
             hypervisor_ip, vf_labels, False)
         time.sleep(2)
+        link_state = self._hypervisor_vf_link_state(hypervisor_ip, vf_labels)
+        if link_state and link_state != 'disable':
+            raise unittest.SkipTest(
+                'Host VF link-state is %r after disable on %s labels %s; '
+                'cannot induce transmit drops' % (
+                    link_state, hypervisor_ip, vf_labels))
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
         LOG.warning(
-            'Inducing transmit drops on %s VF %s: host link disabled, '
-            'guest iface up, %d UDP datagrams %s -> %s (sysfs tx_dropped=%s)',
-            hypervisor_ip, vf_labels, flood_count, bind_ip, peer_ip,
-            sysfs_before)
+            'Inducing transmit drops on %s VF %s: host link disabled '
+            '(link-state=%r), guest iface up, %d UDP datagrams %s -> %s '
+            '(host tx_dropped=%s)',
+            hypervisor_ip, vf_labels, link_state or 'unknown', flood_count,
+            bind_ip, peer_ip, sysfs_before)
         self._flood_udp_dataplane(
             ssh_sender, bind_ip, peer_ip, flood_count)
-        self._restore_hypervisor_vf_link(hypervisor_ip, vf_labels)
+        time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
+        self._restore_hypervisor_vf_link(hypervisor_ip, vf_labels)
         LOG.warning(
-            'Transmit drop induce finished on %s VF %s: sysfs tx_dropped '
+            'Transmit drop induce finished on %s VF %s: host tx_dropped '
             'before=%s after=%s',
             hypervisor_ip, vf_labels, sysfs_before, sysfs_after)
         ctx['sysfs_drop_before'] = sysfs_before
@@ -389,32 +459,45 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         self._run_guest_python_script(ssh_client, script, timeout_sec=120)
 
     def _induce_receive_drops(self, ctx, count, min_packets):
-        """Shrink RX ring and flood peer IP to overflow the receiver VF."""
+        """Bring receiver dataplane down and flood to force host VF RX drops.
+
+        Socket-level "no listener" drops do not increment host VF
+        ``rx_dropped`` / ``net_vf_receive_dropped_total``. Taking the guest
+        SR-IOV iface down stops RX descriptor posting so the NIC counts drops.
+        """
         if ':' in ctx['peer_ip']:
             raise unittest.SkipTest(
                 'RX drop flood test currently supports IPv4 SR-IOV peers only')
         receiver = ctx['receiver']
         hypervisor_ip = receiver['hypervisor_ip']
         vf_labels = receiver['vf_labels']
+        mac_address = receiver['port']['mac_address']
         bind_ip = ctx['sender']['port']['fixed_ips'][0]['ip_address']
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_packets)
-        self._maybe_shrink_guest_rx_ring(
-            ctx['ssh_receiver'], receiver['port']['mac_address'])
+        self._maybe_shrink_guest_rx_ring(ctx['ssh_receiver'], mac_address)
+        iface = self._set_guest_dataplane_iface_state(
+            ctx['ssh_receiver'], mac_address, up=False)
+        self.addCleanup(
+            self._restore_guest_dataplane_iface,
+            ctx['ssh_receiver'], mac_address)
+        time.sleep(1)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(
-            'Inducing receive drops on %s VF %s: %d UDP datagrams %s -> %s '
-            'with no listener (sysfs rx_dropped=%s)',
-            hypervisor_ip, vf_labels, flood_count, bind_ip, ctx['peer_ip'],
-            sysfs_before)
+            'Inducing receive drops on %s VF %s: guest iface %s down, '
+            '%d UDP datagrams %s -> %s (host rx_dropped=%s)',
+            hypervisor_ip, vf_labels, iface, flood_count, bind_ip,
+            ctx['peer_ip'], sysfs_before)
         self._flood_udp_dataplane(
             ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
+        time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
+        self._restore_guest_dataplane_iface(ctx['ssh_receiver'], mac_address)
         LOG.warning(
-            'Receive drop induce finished on %s VF %s: sysfs rx_dropped '
+            'Receive drop induce finished on %s VF %s: host rx_dropped '
             'before=%s after=%s',
             hypervisor_ip, vf_labels, sysfs_before, sysfs_after)
         ctx['sysfs_drop_before'] = sysfs_before
@@ -577,7 +660,7 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             sysfs_stat_name='tx_dropped')
 
     def test_z_net_vf_receive_dropped_total_increases_with_traffic(self):
-        """Verify net_vf_receive_dropped_total increases after RX UDP flood."""
+        """Verify net_vf_receive_dropped_total increases after RX iface-down flood."""
         self._test_vf_drop_counter_increases(
             metrics_base.NET_VF_RECEIVE_DROPPED_METRIC, 'receiver',
             traffic_generator=self._induce_receive_drops,

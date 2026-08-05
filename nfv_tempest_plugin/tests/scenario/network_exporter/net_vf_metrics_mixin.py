@@ -505,6 +505,54 @@ class NetVfMetricsMixin(object):
             hypervisor_ip, vf_labels, stats_bases)
         return {}
 
+    def _host_vf_ip_link_stat(self, hypervisor_ip, vf_labels, stat_name):
+        """Read VF rx_dropped/tx_dropped from ``ip -s link`` on the PF."""
+        if stat_name not in ('rx_dropped', 'tx_dropped'):
+            return None
+        pf_netdev = self._pf_netdev_for_vf_admin(hypervisor_ip, vf_labels)
+        direction = 'rx' if stat_name == 'rx_dropped' else 'tx'
+        remote = (
+            'PF=%s VF=%s DIR=%s python3 - <<\'PY\'\n'
+            'import os, re, subprocess\n'
+            'pf = os.environ["PF"]\n'
+            'vf = os.environ["VF"]\n'
+            'direction = os.environ["DIR"]\n'
+            'try:\n'
+            '    out = subprocess.check_output(\n'
+            '        ["ip", "-s", "link", "show", "dev", pf],\n'
+            '        text=True, stderr=subprocess.DEVNULL)\n'
+            'except Exception:\n'
+            '    raise SystemExit(0)\n'
+            'rx_re = re.compile(\n'
+            '    r"RX:\\s*bytes\\s+packets\\s+mcast\\s+bcast\\s+dropped\\s*\\n"'
+            '    r"\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)")\n'
+            'tx_re = re.compile(\n'
+            '    r"TX:\\s*bytes\\s+packets\\s+dropped\\s*\\n"'
+            '    r"\\s*(\\d+)\\s+(\\d+)\\s+(\\d+)")\n'
+            'for part in re.split(r"(?m)(?=^\\s*vf\\s+\\d+)", out):\n'
+            '    m = re.match(r"\\s*vf\\s+(\\d+)\\b", part)\n'
+            '    if not m or m.group(1) != vf:\n'
+            '        continue\n'
+            '    if direction == "rx":\n'
+            '        m2 = rx_re.search(part)\n'
+            '        if m2:\n'
+            '            print(m2.group(5))\n'
+            '    else:\n'
+            '        m2 = tx_re.search(part)\n'
+            '        if m2:\n'
+            '            print(m2.group(3))\n'
+            '    break\n'
+            'PY' % (
+                shlex.quote(pf_netdev),
+                shlex.quote(str(vf_labels['vf'])),
+                shlex.quote(direction)))
+        raw = self._ssh_run_unchecked_on_hypervisor(
+            hypervisor_ip, remote).strip().splitlines()
+        raw = raw[-1].strip() if raw else ''
+        if raw.isdigit():
+            return int(raw)
+        return None
+
     def _host_vf_sysfs_stat(self, hypervisor_ip, vf_labels, stat_name):
         """Read one VF counter from host sysfs (same source as net_vf exporter)."""
         for path in self._vf_sysfs_stat_file_paths(
@@ -514,8 +562,12 @@ class NetVfMetricsMixin(object):
                 'cat %s 2>/dev/null' % shlex.quote(path)).strip()
             if raw.isdigit():
                 return int(raw)
-        return self._host_vf_sysfs_stats_map(hypervisor_ip, vf_labels).get(
+        mapped = self._host_vf_sysfs_stats_map(hypervisor_ip, vf_labels).get(
             stat_name)
+        if mapped is not None:
+            return mapped
+        return self._host_vf_ip_link_stat(
+            hypervisor_ip, vf_labels, stat_name)
 
     def _host_vf_sysfs_stats_available(self, hypervisor_ip, vf_labels):
         """Return sorted VF stat names exposed under host sysfs, or []."""
@@ -725,14 +777,14 @@ class NetVfMetricsMixin(object):
         if (sysfs_before is not None and sysfs_after is not None and
                 sysfs_after <= sysfs_before):
             raise unittest.SkipTest(
-                'Host VF sysfs %s on %s unchanged after drop induce '
+                'Host VF %s on %s unchanged after drop induce '
                 '(before=%s after=%s). The NIC/driver may not increment VF '
                 'drop stats for this test method.' % (
                     sysfs_stat_name, hypervisor_ip, sysfs_before,
                     sysfs_after))
 
         LOG.warning(
-            'Host VF sysfs %s unavailable around drop induce on %s for '
+            'Host VF %s unavailable around drop induce on %s for '
             'labels %s (baseline=%s before=%r after=%r, available=%s); '
             'validating %s via Prometheus delta and metric-storage. %s',
             sysfs_stat_name, hypervisor_ip, vf_labels, baseline_sysfs,
