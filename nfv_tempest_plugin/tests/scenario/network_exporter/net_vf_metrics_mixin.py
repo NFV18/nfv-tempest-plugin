@@ -776,21 +776,21 @@ class NetVfMetricsMixin(object):
 
         if (sysfs_before is not None and sysfs_after is not None and
                 sysfs_after <= sysfs_before):
-            raise unittest.SkipTest(
+            LOG.warning(
                 'Host VF %s on %s unchanged after drop induce '
-                '(before=%s after=%s). The NIC/driver may not increment VF '
-                'drop stats for this test method.' % (
-                    sysfs_stat_name, hypervisor_ip, sysfs_before,
-                    sysfs_after))
-
-        LOG.warning(
-            'Host VF %s unavailable around drop induce on %s for '
-            'labels %s (baseline=%s before=%r after=%r, available=%s); '
-            'validating %s via Prometheus delta and metric-storage. %s',
-            sysfs_stat_name, hypervisor_ip, vf_labels, baseline_sysfs,
-            sysfs_before, sysfs_after,
-            self._host_vf_sysfs_stats_available(hypervisor_ip, vf_labels) or
-            'none', metric_name, promql)
+                '(before=%s after=%s); requiring Prometheus :9105 and '
+                'metric-storage increase instead. %s',
+                sysfs_stat_name, hypervisor_ip, sysfs_before, sysfs_after,
+                promql)
+        else:
+            LOG.warning(
+                'Host VF %s unavailable around drop induce on %s for '
+                'labels %s (baseline=%s before=%r after=%r, available=%s); '
+                'validating %s via Prometheus delta and metric-storage. %s',
+                sysfs_stat_name, hypervisor_ip, vf_labels, baseline_sysfs,
+                sysfs_before, sysfs_after,
+                self._host_vf_sysfs_stats_available(hypervisor_ip, vf_labels) or
+                'none', metric_name, promql)
         self._wait_for_vf_prom_and_storage_increase(
             hypervisor_ip, vf_labels, metric_name, baseline_prom,
             'drops', min_delta=1, baseline_storage=baseline_storage)

@@ -459,11 +459,13 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         self._run_guest_python_script(ssh_client, script, timeout_sec=120)
 
     def _induce_receive_drops(self, ctx, count, min_packets):
-        """Bring receiver dataplane down and flood to force host VF RX drops.
+        """Disable host VF link and guest RX path, then flood from the peer.
 
         Socket-level "no listener" drops do not increment host VF
-        ``rx_dropped`` / ``net_vf_receive_dropped_total``. Taking the guest
-        SR-IOV iface down stops RX descriptor posting so the NIC counts drops.
+        ``rx_dropped`` / ``net_vf_receive_dropped_total``. Disabling the
+        host VF link (and taking the guest dataplane iface down when sudo
+        allows) is intended to make the PF count drops for frames aimed at
+        that VF.
         """
         if ':' in ctx['peer_ip']:
             raise unittest.SkipTest(
@@ -476,26 +478,43 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         flood_count = (
             CONF.nfv_plugin_options.network_exporter_sriov_rx_drop_flood_packets)
         self._maybe_shrink_guest_rx_ring(ctx['ssh_receiver'], mac_address)
-        iface = self._set_guest_dataplane_iface_state(
-            ctx['ssh_receiver'], mac_address, up=False)
+
         self.addCleanup(
-            self._restore_guest_dataplane_iface,
-            ctx['ssh_receiver'], mac_address)
+            self._restore_hypervisor_vf_link, hypervisor_ip, vf_labels)
+        self._set_hypervisor_vf_link_state(
+            hypervisor_ip, vf_labels, False)
         time.sleep(1)
+        link_state = self._hypervisor_vf_link_state(hypervisor_ip, vf_labels)
+
+        iface = None
+        try:
+            iface = self._set_guest_dataplane_iface_state(
+                ctx['ssh_receiver'], mac_address, up=False)
+            self.addCleanup(
+                self._restore_guest_dataplane_iface,
+                ctx['ssh_receiver'], mac_address)
+        except unittest.SkipTest:
+            LOG.warning(
+                'Guest dataplane down unavailable for RX drop induce on %s; '
+                'continuing with host VF link-state=%r only',
+                hypervisor_ip, link_state or 'unknown')
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
         LOG.warning(
-            'Inducing receive drops on %s VF %s: guest iface %s down, '
-            '%d UDP datagrams %s -> %s (host rx_dropped=%s)',
-            hypervisor_ip, vf_labels, iface, flood_count, bind_ip,
-            ctx['peer_ip'], sysfs_before)
+            'Inducing receive drops on %s VF %s: host link-state=%r, '
+            'guest iface=%s, %d UDP datagrams %s -> %s (host rx_dropped=%s)',
+            hypervisor_ip, vf_labels, link_state or 'unknown',
+            iface or 'unchanged', flood_count, bind_ip, ctx['peer_ip'],
+            sysfs_before)
         self._flood_udp_dataplane(
             ctx['ssh_sender'], bind_ip, ctx['peer_ip'], flood_count)
         time.sleep(1)
         sysfs_after = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
-        self._restore_guest_dataplane_iface(ctx['ssh_receiver'], mac_address)
+        if iface:
+            self._restore_guest_dataplane_iface(ctx['ssh_receiver'], mac_address)
+        self._restore_hypervisor_vf_link(hypervisor_ip, vf_labels)
         LOG.warning(
             'Receive drop induce finished on %s VF %s: host rx_dropped '
             'before=%s after=%s',
