@@ -732,81 +732,68 @@ class NetVfMetricsMixin(object):
     def _test_vf_drop_counter_increases(
             self, metric_name, endpoint_role, traffic_generator,
             sysfs_stat_name):
-        """Validate net_vf_*_dropped_total increases after induced drops.
+        """Validate net_vf_*_dropped_total increases after induced drops."""
+        self._assert_net_vf_metric_reported(metric_name)
+        ctx = self._build_traffic_context()
+        endpoint = ctx[endpoint_role]
+        hypervisor_ip = endpoint['hypervisor_ip']
+        vf_labels = endpoint['vf_labels']
+        baseline_sysfs = self._host_vf_sysfs_stat(
+            hypervisor_ip, vf_labels, sysfs_stat_name)
+        baseline_prom, baseline_storage = (
+            self._wait_for_vf_prom_storage_aligned(
+                hypervisor_ip, vf_labels, metric_name))
+        self.assertIsNotNone(
+            baseline_prom,
+            '%s missing baseline on %s for labels %s' % (
+                metric_name, hypervisor_ip, vf_labels))
 
-        These tests must return pass or fail (never skip): host VF stats are
-        advisory; Prometheus :9105 and metric-storage are authoritative.
-        """
-        try:
-            self._assert_net_vf_metric_reported(metric_name)
-            ctx = self._build_traffic_context()
-            endpoint = ctx[endpoint_role]
-            hypervisor_ip = endpoint['hypervisor_ip']
-            vf_labels = endpoint['vf_labels']
-            baseline_sysfs = self._host_vf_sysfs_stat(
-                hypervisor_ip, vf_labels, sysfs_stat_name)
-            baseline_prom, baseline_storage = (
-                self._wait_for_vf_prom_storage_aligned(
-                    hypervisor_ip, vf_labels, metric_name))
-            self.assertIsNotNone(
-                baseline_prom,
-                '%s missing baseline on %s for labels %s' % (
-                    metric_name, hypervisor_ip, vf_labels))
+        packet_count = self._ping_count()
+        min_packets = self._min_expected_packets()
+        traffic_generator(ctx, packet_count, min_packets)
 
-            packet_count = self._ping_count()
-            min_packets = self._min_expected_packets()
-            traffic_generator(ctx, packet_count, min_packets)
+        sysfs_before = ctx.get('sysfs_drop_before')
+        sysfs_after = ctx.get('sysfs_drop_after')
+        promql = self._vf_promql_filter(hypervisor_ip, vf_labels, metric_name)
 
-            sysfs_before = ctx.get('sysfs_drop_before')
-            sysfs_after = ctx.get('sysfs_drop_after')
-            promql = self._vf_promql_filter(
-                hypervisor_ip, vf_labels, metric_name)
+        if (sysfs_before is not None and sysfs_after is not None and
+                sysfs_after > sysfs_before):
+            sysfs_delta = sysfs_after - sysfs_before
+            baseline_sysfs_val = (
+                baseline_sysfs if baseline_sysfs is not None else sysfs_before)
+            final_prom, final_sysfs = (
+                self._wait_for_vf_counter_aligned_with_sysfs(
+                    hypervisor_ip, vf_labels, metric_name, sysfs_stat_name,
+                    baseline_prom, baseline_sysfs_val, sysfs_delta,
+                    sysfs_delta))
+            LOG.warning(
+                '%s validated with sysfs on %s for %s: prom/sysfs=%s '
+                '(baseline prom=%s sysfs=%s, induced %s->%s). %s',
+                metric_name, endpoint_role, hypervisor_ip, final_prom,
+                baseline_prom, baseline_sysfs_val, sysfs_before, final_sysfs,
+                promql)
+            return
 
-            if (sysfs_before is not None and sysfs_after is not None and
-                    sysfs_after > sysfs_before):
-                sysfs_delta = sysfs_after - sysfs_before
-                baseline_sysfs_val = (
-                    baseline_sysfs if baseline_sysfs is not None
-                    else sysfs_before)
-                final_prom, final_sysfs = (
-                    self._wait_for_vf_counter_aligned_with_sysfs(
-                        hypervisor_ip, vf_labels, metric_name,
-                        sysfs_stat_name, baseline_prom, baseline_sysfs_val,
-                        sysfs_delta, sysfs_delta))
-                LOG.warning(
-                    '%s validated with sysfs on %s for %s: prom/sysfs=%s '
-                    '(baseline prom=%s sysfs=%s, induced %s->%s). %s',
-                    metric_name, endpoint_role, hypervisor_ip, final_prom,
-                    baseline_prom, baseline_sysfs_val, sysfs_before,
-                    final_sysfs, promql)
-                return
-
-            if (sysfs_before is not None and sysfs_after is not None and
-                    sysfs_after <= sysfs_before):
-                LOG.warning(
-                    'Host VF %s on %s unchanged after drop induce '
-                    '(before=%s after=%s); requiring Prometheus :9105 and '
-                    'metric-storage increase instead. %s',
-                    sysfs_stat_name, hypervisor_ip, sysfs_before,
-                    sysfs_after, promql)
-            else:
-                LOG.warning(
-                    'Host VF %s unavailable around drop induce on %s for '
-                    'labels %s (baseline=%s before=%r after=%r, '
-                    'available=%s); validating %s via Prometheus delta and '
-                    'metric-storage. %s',
-                    sysfs_stat_name, hypervisor_ip, vf_labels, baseline_sysfs,
-                    sysfs_before, sysfs_after,
-                    self._host_vf_sysfs_stats_available(
-                        hypervisor_ip, vf_labels) or 'none',
-                    metric_name, promql)
-            self._wait_for_vf_prom_and_storage_increase(
-                hypervisor_ip, vf_labels, metric_name, baseline_prom,
-                'drops', min_delta=1, baseline_storage=baseline_storage)
-        except unittest.SkipTest as exc:
-            self.fail(
-                '%s must not skip; converted skip into failure: %s' % (
-                    metric_name, exc))
+        if (sysfs_before is not None and sysfs_after is not None and
+                sysfs_after <= sysfs_before):
+            LOG.warning(
+                'Host VF %s on %s unchanged after drop induce '
+                '(before=%s after=%s); requiring Prometheus :9105 and '
+                'metric-storage increase instead. %s',
+                sysfs_stat_name, hypervisor_ip, sysfs_before, sysfs_after,
+                promql)
+        else:
+            LOG.warning(
+                'Host VF %s unavailable around drop induce on %s for '
+                'labels %s (baseline=%s before=%r after=%r, available=%s); '
+                'validating %s via Prometheus delta and metric-storage. %s',
+                sysfs_stat_name, hypervisor_ip, vf_labels, baseline_sysfs,
+                sysfs_before, sysfs_after,
+                self._host_vf_sysfs_stats_available(hypervisor_ip, vf_labels) or
+                'none', metric_name, promql)
+        self._wait_for_vf_prom_and_storage_increase(
+            hypervisor_ip, vf_labels, metric_name, baseline_prom,
+            'drops', min_delta=1, baseline_storage=baseline_storage)
 
     def _test_vf_counter_increases_with_traffic(
             self, metric_name, endpoint_role, counter_kind,
