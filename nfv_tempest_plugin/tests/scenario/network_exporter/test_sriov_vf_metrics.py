@@ -318,7 +318,7 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         """Bring the guest SR-IOV dataplane iface up or down (needs sudo)."""
         sudo = self._guest_sudo_prefix(ssh_client)
         if not sudo:
-            raise unittest.SkipTest(
+            raise RuntimeError(
                 'Passwordless sudo required on the guest to toggle the '
                 'SR-IOV dataplane interface for drop induction')
         iface = self._guest_dataplane_iface(ssh_client, mac_address)
@@ -364,10 +364,10 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         time.sleep(2)
         link_state = self._hypervisor_vf_link_state(hypervisor_ip, vf_labels)
         if link_state and link_state != 'disable':
-            raise unittest.SkipTest(
+            LOG.warning(
                 'Host VF link-state is %r after disable on %s labels %s; '
-                'cannot induce transmit drops' % (
-                    link_state, hypervisor_ip, vf_labels))
+                'continuing flood and requiring Prometheus increase',
+                link_state, hypervisor_ip, vf_labels)
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'tx_dropped')
@@ -468,8 +468,9 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
         that VF.
         """
         if ':' in ctx['peer_ip']:
-            raise unittest.SkipTest(
-                'RX drop flood test currently supports IPv4 SR-IOV peers only')
+            self.fail(
+                'RX drop flood test currently supports IPv4 SR-IOV peers only '
+                '(peer_ip=%s)' % ctx['peer_ip'])
         receiver = ctx['receiver']
         hypervisor_ip = receiver['hypervisor_ip']
         vf_labels = receiver['vf_labels']
@@ -493,11 +494,11 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
             self.addCleanup(
                 self._restore_guest_dataplane_iface,
                 ctx['ssh_receiver'], mac_address)
-        except unittest.SkipTest:
+        except (RuntimeError, unittest.SkipTest) as exc:
             LOG.warning(
-                'Guest dataplane down unavailable for RX drop induce on %s; '
-                'continuing with host VF link-state=%r only',
-                hypervisor_ip, link_state or 'unknown')
+                'Guest dataplane down unavailable for RX drop induce on %s '
+                '(%s); continuing with host VF link-state=%r only',
+                hypervisor_ip, exc, link_state or 'unknown')
 
         sysfs_before = self._host_vf_sysfs_stat(
             hypervisor_ip, vf_labels, 'rx_dropped')
