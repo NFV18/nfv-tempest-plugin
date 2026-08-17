@@ -481,19 +481,27 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
         if mgmt_network is not None:
             self.mgmt_network = mgmt_network
 
-    def _add_subnet_to_router(self, mgmt_subnet_only=False):
+    def _add_subnet_to_router(self, mgmt_subnet_only=False,
+                              test_networks_only=False):
         """Add subnets of existing networks to the router
 
         The subnets attached to the router will get the ability for the
         instances to get dhcp allocations on the instance interfaces
 
         :param mgmt_subnet_only: Attach only mgmt network subnet to router
+        :param test_networks_only: Attach only subnets from test_network_dict
         """
         mgmt_net_name = self.mgmt_network
         mgmt_net = self.test_network_dict[mgmt_net_name]
 
         subnets = []
-        if not mgmt_subnet_only:
+        if mgmt_subnet_only:
+            subnets.append(mgmt_net['subnet-id'])
+        elif test_networks_only:
+            for net_param in self.test_network_dict.values():
+                if net_param.get('subnet-id'):
+                    subnets.append(net_param['subnet-id'])
+        else:
             nets = self.os_admin.networks_client.list_networks()['networks']
             for net in nets:
                 if not net['router:external'] \
@@ -505,8 +513,6 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
                             net.get('name'), net.get('id'))
                         continue
                     subnets.append(net['subnets'][0])
-        else:
-            subnets.append(mgmt_net['subnet-id'])
         seen_routers = self.os_admin.routers_client.list_routers()['routers']
         self.assertGreater(len(seen_routers), 0,
                            "Test require at least admin router. please check")
@@ -1036,10 +1042,16 @@ class BareMetalManager(api_version_utils.BaseMicroversionTest,
             router_exist = self.test_setup_dict[test]['router']
         if router_exist:
             mgmt_subnet_only = False
+            test_networks_only = False
             if kwargs.get('mgmt_subnet_only'):
                 mgmt_subnet_only = True
                 kwargs.pop('mgmt_subnet_only')
-            self._add_subnet_to_router(mgmt_subnet_only)
+            if kwargs.get('test_networks_only'):
+                test_networks_only = True
+                kwargs.pop('test_networks_only')
+            self._add_subnet_to_router(
+                mgmt_subnet_only=mgmt_subnet_only,
+                test_networks_only=test_networks_only)
         # Prepare cloudinit
         packages = None
         if 'package-names' in self.test_setup_dict[test].keys():

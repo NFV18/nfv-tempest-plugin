@@ -713,6 +713,35 @@ class ManagerMixin(object):
                         .split('.')[0]}
         return servers, key_pair
 
+    @staticmethod
+    def _parse_ovs_statistics_map(raw):
+        """Parse ovs-vsctl statistics map output into a string->int dict."""
+        text = (raw or '').strip()
+        if not text or text in ('{}', '[]'):
+            return {}
+        if text.startswith('{') and text.endswith('}'):
+            text = text[1:-1].strip()
+        if not text:
+            return {}
+        stats = {}
+        for item in text.split(','):
+            item = item.strip()
+            if '=' not in item:
+                continue
+            key, _, value = item.partition('=')
+            key = key.strip().strip('"')
+            value = value.strip().strip('"')
+            if not key:
+                continue
+            try:
+                stats[key] = int(value)
+            except (TypeError, ValueError):
+                try:
+                    stats[key] = int(float(value))
+                except (TypeError, ValueError):
+                    continue
+        return stats
+
     def get_ovs_interface_statistics(self, interfaces, previous_stats=None,
                                      hypervisor=None):
         """This method get ovs interface statistics
@@ -740,12 +769,14 @@ class ManagerMixin(object):
         for interface in interfaces:
             command = 'sudo ovs-vsctl get Interface {} ' \
                       'statistics'.format(interface)
-            statistics[interface] = \
-                yaml.safe_load(
-                    shell_utils.run_command_over_ssh(
-                        hypervisor_ip, command).replace(
-                        '"', '').replace(
-                        '{', '{"').replace(', ', ', "').replace('=', '":'))
+            raw = shell_utils.run_command_over_ssh(
+                hypervisor_ip, command)
+            statistics[interface] = self._parse_ovs_statistics_map(raw)
+            if not statistics[interface] and (raw or '').strip() not in (
+                    '', '{}', '[]'):
+                LOG.warning(
+                    'Could not parse OVS statistics for %s on %s: %r',
+                    interface, hypervisor_ip, raw[:500])
             if previous_stats is not None and \
                interface in previous_stats.keys():
                 for stat in statistics[interface].keys():
@@ -757,6 +788,30 @@ class ManagerMixin(object):
                                          'to compare'.format(stat))
 
         return statistics
+
+    def _ovs_interface_stat_int(self, stats, key):
+        """Return one OVS Interface statistics counter (missing keys mean zero)."""
+        if not stats:
+            return 0
+        value = stats.get(key, 0)
+        if value is None:
+            return 0
+        return int(value)
+
+    def _ovs_interface_error_exporter_value(self, stats, stat_key):
+        """Return OVS error counter as openstack-network-exporter iface does."""
+        if stat_key == 'rx_dropped':
+            missed = self._ovs_interface_stat_int(stats, 'rx_missed_errors')
+            if missed > 0:
+                return missed
+            return self._ovs_interface_stat_int(stats, 'rx_dropped')
+        if stat_key == 'tx_errors':
+            failures = self._ovs_interface_stat_int(
+                stats, 'ovs_tx_failure_drops')
+            if failures > 0:
+                return failures
+            return self._ovs_interface_stat_int(stats, 'tx_errors')
+        return self._ovs_interface_stat_int(stats, stat_key)
 
     def get_ovs_multicast_groups(self, switch, multicast_ip=None,
                                  hypervisor=None):
