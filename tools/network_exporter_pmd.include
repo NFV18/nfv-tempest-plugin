@@ -1,0 +1,3 @@
+^nfv_tempest_plugin\.tests\.scenario\.network_exporter\.test_ovs_pmd_iteration_metrics\.
+^nfv_tempest_plugin\.tests\.scenario\.network_exporter\.test_ovs_pmd_packet_metrics\.
+^nfv_tempest_plugin\.tests\.scenario\.network_exporter\.test_ovs_pmd_cpu_usage_metrics\.
