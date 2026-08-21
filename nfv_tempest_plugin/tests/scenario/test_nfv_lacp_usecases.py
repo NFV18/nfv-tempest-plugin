@@ -15,6 +15,7 @@
 
 import json
 import time
+import unittest
 
 from nfv_tempest_plugin.tests.common import shell_utilities as shell_utils
 from nfv_tempest_plugin.tests.scenario import base_test
@@ -206,6 +207,8 @@ class TestLacpScenarios(base_test.BaseTest):
                     private_key=key_pair['private_key'])
                 ssh_source.exec_command(kill_cmd)
 
+    @unittest.skip("OVS restart breaks vhostuser sockets on DPDK datapath - "
+                   "VMs lose connectivity permanently")
     def test_restart_ovs(self, test='restart_ovs'):
         """Test restart_ovs
 
