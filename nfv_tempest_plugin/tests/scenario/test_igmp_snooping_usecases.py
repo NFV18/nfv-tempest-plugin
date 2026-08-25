@@ -369,6 +369,9 @@ class TestIgmpSnoopingScenarios(base_test.BaseTest):
                                   role['mcast_output'])
                     server['ssh_source'].exec_command(cmd)
 
+        # wait for IGMP reports to be processed by OVN
+        time.sleep(10)
+
         # check groups are created
         for hyp in hypervisors.keys():
 
