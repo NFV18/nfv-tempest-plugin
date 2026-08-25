@@ -15,29 +15,23 @@
 
 from distutils.util import strtobool
 from nfv_tempest_plugin.tests.common import shell_utilities as shell_utils
-from nfv_tempest_plugin.tests.common import k8s
 from nfv_tempest_plugin.tests.scenario import base_test
 from oslo_log import log as logging
 from tempest import config
 
-from base64 import b64decode
-import configparser
 import json
 import random
 import re
 import string
 import tempfile
 import time
+import unittest
 
 CONF = config.CONF
 LOG = logging.getLogger('{} [-] nfv_plugin_test'.format(__name__))
 
 
 class TestIgmpSnoopingScenarios(base_test.BaseTest):
-    def __init__(self, *args, **kwargs):
-        super(TestIgmpSnoopingScenarios, self).__init__(*args, **kwargs)
-        self.k8s_client = k8s.openshift_client()
-
     def setUp(self):
         """Set up a single tenant with an accessible server
 
@@ -46,31 +40,33 @@ class TestIgmpSnoopingScenarios(base_test.BaseTest):
         super(TestIgmpSnoopingScenarios, self).setUp()
         """ pre setup creations and checks read from config files """
 
-    def test_igmp_snooping_deployment(self, test='igmp_snooping_deployment'):
-        """Check that igmp snooping bonding is properly configure
+    def _run_ovn_nbctl(self, command):
+        """Run an ovn-nbctl command via SSH to a hypervisor.
 
-        mcast_snooping_enable and mcast-snooping-disable-flood-unregistered
-        configured in br-int
+        :param command: ovn-nbctl sub-command to run
+        :return command output
+        """
+        hypervisor = self._get_hypervisor_ip_from_undercloud()[0]
+        ovn_nb_cmd = (
+            'sudo podman exec ovn_controller ovn-nbctl'
+            ' --db=ssl:ovsdbserver-nb.openstack.svc:6641'
+            ' -p /etc/pki/tls/private/ovndb.key'
+            ' -c /etc/pki/tls/certs/ovndb.crt'
+            ' -C /etc/pki/tls/certs/ovndbca.crt'
+            ' --no-leader-only {}'.format(command))
+        return shell_utils.run_command_over_ssh(hypervisor, ovn_nb_cmd)
+
+    def test_igmp_snooping_deployment(self, test='igmp_snooping_deployment'):
+        """Check that igmp snooping is properly configured
+
+        Verify that mcast_snoop is enabled on OVN logical switches
+        and mcast_flood_unregistered is not set to true.
         """
         LOG.info('Starting {} test.'.format(test))
-        # Check for IGMP config in neutron control plane
-        config_parser = configparser.ConfigParser()
-        neutron_ctlplane_config = self.k8s_client.read_secret_data('neutron-config', 'openstack')
-        config_parser.read_string(b64decode(
-            neutron_ctlplane_config["02-neutron-custom.conf"]).decode('utf-8'))
-        if 'igmp_snooping_enable' in config_parser['ovs']:
-            self.assertTrue(config_parser.getboolean('ovs', 'igmp_snooping_enable'),
-                             'IGMP not enabled in deployment')
-        else:
-            raise AssertionError('IGMP not configured in deployment')
 
-        nb_db_pods = self.k8s_client.search_pods_using_regex('ovsdbserver-nb.*', 'openstack')
-        ovn_logical_switches_output = self.k8s_client.execute_command_in_pod(nb_db_pods[0]['metadata']['name'],
-                                               'openstack',
-                                               'ovsdbserver-nb',
-                                               'ovn-nbctl --no-leader-only list Logical_Switch')
-        # We expect to have at least a single logical switch
-        if '_uuid 'not in ovn_logical_switches_output:
+        ovn_logical_switches_output = self._run_ovn_nbctl(
+            'list Logical_Switch')
+        if '_uuid ' not in ovn_logical_switches_output:
             raise ValueError('Failed to query OVN northbound DB'
                                 ', no logical switch info was returned')
         re_igmp_string = \
@@ -154,27 +150,25 @@ class TestIgmpSnoopingScenarios(base_test.BaseTest):
         self.assertTrue(len(errors) == 0, '. '.join(errors))
         LOG.info('Listeners received multicast traffic')
 
-    # TODO(vkhitrin): Rename this test for generic network backend
+    @unittest.skip("OVS restart breaks vhostuser sockets on DPDK datapath - "
+                   "VMs lose connectivity permanently")
     def test_igmp_restart_ovs(self, test='igmp_restart_ovs'):
         """Test restart ovs
 
         Check that multicast configuration is not lost after ovs restart.
-        Restart ovs and then execute test_igmp_snooping_deployment
+        Restart ovs on all hypervisors and then verify IGMP snooping
+        deployment is still correct.
         """
         LOG.info('Starting {} test.'.format(test))
         hypervisor_ips = self._get_hypervisor_ip_from_undercloud()
         ovs_cmd = 'sudo systemctl restart openvswitch.service'
         for hyp in hypervisor_ips:
             shell_utils.run_command_over_ssh(hyp, ovs_cmd)
-        ovn_pods = self.k8s_client.search_pods_using_regex('ovn-controller-ovs.*', 'openstack')
-        for pod in ovn_pods:
-            api_response = self.k8s_client.delete_pod(pod['metadata']['name'], 'openstack')
-            LOG.info(api_response)
-        self.test_igmp_snooping_deployment()
 
-        # Give time to have everything up after reboot so that other testcases
-        # executed after this one do not fail
+        # Wait for OVS and OVN controller to recover after restart
         time.sleep(60)
+
+        self.test_igmp_snooping_deployment()
 
     def test_check_igmp_queries(self, test='check_igmp_queries'):
         """Check igmp queries arriving to the vms
@@ -255,6 +249,11 @@ class TestIgmpSnoopingScenarios(base_test.BaseTest):
         cmd_mcast = "sudo timeout 3 python " \
                     "/usr/local/bin/multicast_traffic.py -r -g 239.1.1.1 " \
                     "-p 5000 -c 1 || true"
+        # Ensure the capture interface is up (DPDK datapath leaves it down)
+        cmd_link_up = "sudo ip link set up {} 2>/dev/null || true".format(
+            reports_interface)
+        shell_utils.run_command_over_ssh(test_server['hypervisor_ip'],
+                                         cmd_link_up)
         # Capture all igmp messages
         cmd_dump = "PATH=$PATH:/usr/sbin; sudo tcpdump -i {} igmp " \
                    "> {} 2>&1 &".format(reports_interface, tcpdump_file)

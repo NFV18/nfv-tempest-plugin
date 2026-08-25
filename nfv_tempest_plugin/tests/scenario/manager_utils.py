@@ -804,19 +804,22 @@ class ManagerMixin(object):
         """
         output_data = []
         multicast_ips = []
-        controller = shell_utils.get_controllers_ip_from_undercloud(
-            shell=CONF.nfv_plugin_options.undercloud_rc_file)[0]
-        ovn_igmp_cmd = ('sudo podman exec -it ovn_controller'
-                        ' ovn-sbctl --no-leader-only list igmp_group')
+        hypervisor = self._get_hypervisor_ip_from_undercloud()[0]
+        ovn_igmp_cmd = (
+            'sudo podman exec ovn_controller ovn-sbctl'
+            ' --db=ssl:ovsdbserver-sb.openstack.svc:6642'
+            ' -p /etc/pki/tls/private/ovndb.key'
+            ' -c /etc/pki/tls/certs/ovndb.crt'
+            ' -C /etc/pki/tls/certs/ovndbca.crt'
+            ' --no-leader-only list igmp_group')
         ovn_igmp_output = shell_utils.run_command_over_ssh(
-            controller, ovn_igmp_cmd)
+            hypervisor, ovn_igmp_cmd)
         for string in re.split(r'\n+', ovn_igmp_output):
             if 'address' in string:
                 igmp_ip = re.sub(r'address\s+ :\s+',
                                  '', string.rstrip())
                 multicast_ips.append(igmp_ip.replace('"', ''))
         if multicast_ips:
-            # Iterate over unique IP entries
             for ip in set(multicast_ips):
                 data = {}
                 data['GROUP'] = ip
