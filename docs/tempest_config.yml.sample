@@ -73,8 +73,54 @@ test-networks:
 # Per-test flavor/image selection (optional). When omitted, compute.flavor_ref is used.
 # network_exporter_sriov_vf_metrics also needs a direct test-network (see above) and
 # [nfv_plugin_options] network_exporter_sriov_physnet matching its physical_network.
+# network_exporter_generic_traffic boots two VMs on a shared provider network (mgmt plus
+# at least one non-SR-IOV dataplane network with L2/L3 connectivity between them,
+# typically port_type: normal such as vlan1500 above). Direct (SR-IOV) test-networks
+# are skipped automatically. Only the mgmt subnet is attached to the router (dataplane
+# uses L2); this avoids Neutron BadRequest when multiple subnets share a CIDR.
+# Guests need passwordless sudo for fast ICMP (network_exporter_traffic_ping_count
+# defaults to 5000); otherwise lower the ping count or grant sudo in the guest image.
+# network_exporter_ovs_interface_errors uses the same network layout as generic
+# traffic (mgmt + one shared normal dataplane net) and passwordless sudo for UDP
+# flood / ping during error induce.
+# network_exporter_router_traffic needs mgmt plus at least one other normal
+# test-network with a distinct CIDR; both subnets are attached to the Neutron
+# router (test_networks_only). Cross-subnet ICMP drives ovnc_router_port_traffic_*.
+# sec_groups: true is applied on every normal/mgmt router test-network automatically.
+# Router counter deltas use network_exporter_router_traffic_packet_tolerance_pct
+# (default 50%%) and network_exporter_router_traffic_min_packets (default 400).
+# Counter expectation also scales to network_exporter_router_traffic_metric_scale_pct
+# (default 28%%) of transmitted probes.
+# network_exporter_datapath_flow and network_exporter_datapath_lookup use the same
+# network layout as network_exporter_generic_traffic (mgmt + normal dataplane).
+# Guests need passwordless sudo for full ICMP flood (network_exporter_traffic_ping_count).
+# network_exporter_pmd_iterations and network_exporter_pmd_packets require DPDK-enabled
+# computes (pmd-perf-show). Same network layout as network_exporter_generic_traffic.
+# network_exporter_pmd_cpu_usage validates ovs_pmd_cpu_overhead and ovs_pmd_rxq_usage
+# via pmd-rxq-show on DPDK computes.
+# network_exporter memory tests (test_ovs_memory_metrics) need DPDK/OVS computes with
+# perf metrics enabled on :9105; no tests-setup entry is required.
+# network_exporter OVN controller tests (test_ovnc_config_metrics,
+# test_ovnc_txn_metrics) need OVN :1981 on computes; txn counters require DEBUG
+# and ERRORS metric sets on network-exporter; no tests-setup entry is required.
 tests-setup:
   - name: network_exporter_sriov_vf_metrics
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_generic_traffic
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_ovs_interface_errors
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_router_traffic
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_datapath_flow
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_datapath_lookup
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_pmd_iterations
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_pmd_packets
+    flavor: nfv_qe_base_flavor
+  - name: network_exporter_pmd_cpu_usage
     flavor: nfv_qe_base_flavor
 
 # Flavors used by the test.

@@ -117,10 +117,84 @@ NfvPluginOptions = [
                help='OVS/kernel netdev for the state-test veth (max 15 characters; '
                     'Linux IFNAMSIZ). Host peer is <name> with a -h suffix when '
                     'that fits, otherwise tpst-ovs-pe.'),
+    cfg.IntOpt('network_exporter_traffic_ping_count',
+               default=5000,
+               help='ICMP echo requests sent between two test VMs for '
+                    'ovs_interface_rx/tx_packets/bytes validation.'),
+    cfg.IntOpt('network_exporter_traffic_packet_tolerance_pct',
+               default=15,
+               help='Allowed shortfall (percent) versus '
+                    'network_exporter_traffic_ping_count when comparing '
+                    'OVS counter deltas.'),
     cfg.IntOpt('network_exporter_traffic_min_bytes_per_packet',
                default=64,
                help='Minimum expected byte delta per counted packet when '
                     'validating tx/rx_bytes increases.'),
+    cfg.IntOpt('network_exporter_router_traffic_packet_tolerance_pct',
+               default=50,
+               help='Allowed shortfall (percent) versus '
+                    'network_exporter_traffic_ping_count when comparing '
+                    'ovnc_router_port_traffic_* deltas. Router port counters '
+                    'fed through metric-storage typically reflect roughly half '
+                    'of the ICMP probes sent cross-subnet.'),
+    cfg.IntOpt('network_exporter_router_traffic_min_packets',
+               default=400,
+               help='Floor for ovnc_router_port_traffic_pkts delta regardless '
+                    'of ping count/tolerance.'),
+    cfg.IntOpt('network_exporter_router_traffic_metric_scale_pct',
+               default=28,
+               help='When probes were transmitted, scale the counter '
+                    'expectation to this percent of xmit count (metric-storage '
+                    'typically reflects well under half of routed ICMP).'),
+    cfg.StrOpt('network_exporter_datapath_name',
+               default='ovs-system',
+               help='Preferred OVS datapath name label for ovs_datapath_* '
+                    'metrics. Auto-detected from exporter/dpctl/show when absent '
+                    '(e.g. ovs-netdev on DPDK computes).'),
+    cfg.StrOpt('network_exporter_datapath_type',
+               default='system',
+               help='Preferred OVS datapath type label (system or netdev). '
+                    'Auto-detected when the configured pair is absent.'),
+    cfg.IntOpt('network_exporter_datapath_min_flow_increase',
+               default=1,
+               help='Minimum ovs_datapath_flows_total increase after VM boot '
+                    'and dataplane traffic.'),
+    cfg.IntOpt('network_exporter_datapath_lookup_min_hits',
+               default=1000,
+               help='Minimum ovs_datapath_lookup_hits_total increase after '
+                    'sustained VM ICMP traffic.'),
+    cfg.IntOpt('network_exporter_pmd_min_iterations',
+               default=1000,
+               help='Minimum summed ovs_pmd_total/busy_iterations increase '
+                    'after VM ICMP traffic on DPDK computes.'),
+    cfg.IntOpt('network_exporter_pmd_min_packets',
+               default=0,
+               help='Minimum summed ovs_pmd_rx/tx_packets increase after VM '
+                    'traffic. 0 scales from network_exporter_traffic_ping_count '
+                    'and packet tolerance.'),
+    cfg.FloatOpt('network_exporter_pmd_alignment_tolerance_pct',
+                 default=0.01,
+                 help='Allowed percent drift between pmd-perf-show and live '
+                      ':9105 when counters advance between reads.'),
+    cfg.IntOpt('network_exporter_pmd_alignment_min_delta',
+               default=5000000,
+               help='Minimum allowed absolute drift between sequential PMD '
+                    'perf-show and exporter reads.'),
+    cfg.FloatOpt('network_exporter_pmd_gauge_tolerance',
+                 default=1.0,
+                 help='Allowed absolute percent-point drift between '
+                      'pmd-rxq-show and live :9105 for ovs_pmd_cpu_overhead '
+                      'and ovs_pmd_rxq_usage gauges.'),
+    cfg.FloatOpt('network_exporter_pmd_min_rxq_usage_pct',
+                 default=0.0,
+                 help='When >0, require this ovs_pmd_rxq_usage peak after VM '
+                      'traffic. When 0, traffic activity is validated via '
+                      'ovs_pmd_busy_iterations or ovs_pmd_rx_packets instead.'),
+    cfg.IntOpt('network_exporter_error_udp_flood_packets',
+               default=50000,
+               help='UDP datagrams sent at high rate to a peer dataplane IP '
+                    'without a listener, to induce ovs_interface_rx_dropped '
+                    'increases on the receiver OVS port.'),
     cfg.StrOpt('network_exporter_sriov_physnet',
                default='',
                help='SR-IOV physnet name from tempest_config.yml test-networks '
