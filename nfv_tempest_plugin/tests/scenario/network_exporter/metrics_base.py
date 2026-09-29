@@ -72,6 +72,12 @@ OVS_INTERFACE_ERROR_STAT_TO_METRIC = {
 }
 OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC = 'ovnc_router_port_traffic_pkts'
 OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC = 'ovnc_router_port_traffic_bytes'
+# OVN Southbound DB enrichment labels added to ovnc_router_port_traffic_*
+# (openstack-network-exporter PR #68). router_id/router_name come from the
+# Datapath_Binding external_ids (name -> neutron-<uuid>, name2 -> router name);
+# port_id comes from the Port_Binding logical_port (lrp-/cr-lrp- prefix
+# stripped). When the SB DB is unreachable these degrade to empty strings.
+OVNC_ROUTER_PORT_ENRICHMENT_LABELS = ('router_id', 'router_name', 'port_id')
 OVNC_ENCAP_IP_METRIC = 'ovnc_encap_ip'
 OVNC_ENCAP_TYPE_METRIC = 'ovnc_encap_type'
 OVNC_SB_CONNECTION_METHOD_METRIC = 'ovnc_sb_connection_method'
@@ -952,6 +958,167 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
             self._router_port_label_key(sample['labels']): sample['value']
             for sample in self._router_port_samples(hypervisor_ip, metric_name)
         }
+
+    def _router_port_live_samples(self, metric_name):
+        """Router-port samples from a live OVN :1981/:9105 exposition scrape.
+
+        Unlike metric-storage (Prometheus drops empty-valued labels on
+        ingestion), live exposition text keeps the enrichment labels even when
+        the OVN Southbound DB is unreachable and they are emitted as
+        router_id="" etc. Schema/presence checks therefore read the live scrape.
+        """
+        for hypervisor_ip in self._get_hypervisor_ip_from_undercloud():
+            samples = self._router_port_prom_samples(hypervisor_ip, metric_name)
+            if samples:
+                return samples
+        return []
+
+    def _router_port_any_samples(self, metric_name):
+        """Router-port samples: metric-storage first, live scrape fallback."""
+        samples, _error = self._metric_storage_samples(metric_name)
+        if samples:
+            return samples
+        return self._router_port_live_samples(metric_name)
+
+    @staticmethod
+    def _sample_has_enrichment_label_keys(sample):
+        """True when a sample exposes every PR#68 enrichment label key."""
+        labels = sample['labels']
+        return all(key in labels
+                   for key in OVNC_ROUTER_PORT_ENRICHMENT_LABELS)
+
+    @staticmethod
+    def _enriched_router_port_samples(samples):
+        """Samples with at least one populated (non-empty) enrichment label."""
+        return [
+            sample for sample in samples
+            if any(sample['labels'].get(key)
+                   for key in OVNC_ROUTER_PORT_ENRICHMENT_LABELS)]
+
+    def _router_port_enrichment_by_key(self, metric_name):
+        """Map (datapath, port) -> enrichment labels dict for a metric."""
+        mapping = {}
+        for sample in self._router_port_any_samples(metric_name):
+            key = self._router_port_label_key(sample['labels'])
+            mapping[key] = {
+                label: sample['labels'].get(label, '')
+                for label in OVNC_ROUTER_PORT_ENRICHMENT_LABELS}
+        return mapping
+
+    def _neutron_routers_by_id(self):
+        """Map Neutron router id -> router dict (admin scope)."""
+        routers = self.os_admin.routers_client.list_routers()['routers']
+        return {router['id']: router for router in routers}
+
+    def _neutron_router_port_ids(self):
+        """Neutron router-interface/gateway port ids (admin scope).
+
+        Covers every network:router* device_owner (interface, gateway, HA and
+        distributed variants), which is what OVN logical router ports map back
+        to after the lrp-/cr-lrp- prefix is stripped.
+        """
+        ports = self.os_admin.ports_client.list_ports()['ports']
+        return {
+            port['id'] for port in ports
+            if port.get('device_owner', '').startswith('network:router')}
+
+    def _assert_router_port_enrichment_labels_exposed(self, metric_name):
+        """Assert PR#68 Neutron-context labels are on the router-port series.
+
+        Reads the live OVN exposition when reachable (empty enrichment labels
+        stay visible there); otherwise falls back to populated metric-storage
+        labels, and skips when neither can prove the schema (metric-storage
+        drops empty labels, so their absence there is ambiguous between SB-DB
+        graceful degradation and an un-enriched exporter build).
+        """
+        live_samples = self._router_port_live_samples(metric_name)
+        if live_samples:
+            self.assertTrue(
+                any(self._sample_has_enrichment_label_keys(sample)
+                    for sample in live_samples),
+                '%s live series lack the OVN Southbound enrichment labels %s '
+                '(openstack-network-exporter PR#68). Live labels: %s' % (
+                    metric_name, OVNC_ROUTER_PORT_ENRICHMENT_LABELS,
+                    [sample['labels'] for sample in live_samples][:5]))
+            LOG.warning(
+                '%s exposes Neutron-context labels %s on live OVN scrape',
+                metric_name, OVNC_ROUTER_PORT_ENRICHMENT_LABELS)
+            return
+        storage_samples, error = self._metric_storage_samples(metric_name)
+        self.assertNotEmpty(
+            storage_samples,
+            '%s not on a live OVN scrape or in metric-storage (%s)' % (
+                metric_name, error))
+        if self._enriched_router_port_samples(storage_samples):
+            LOG.warning(
+                '%s carries populated Neutron-context labels in metric-storage '
+                '(live OVN :1981/:9105 scrape unreachable from Tempest)',
+                metric_name)
+            return
+        raise unittest.SkipTest(
+            'Cannot verify %s enrichment labels: no Tempest-reachable OVN '
+            ':1981/:9105 scrape and metric-storage exposes no populated '
+            'router_id/router_name/port_id. metric-storage drops empty labels, '
+            'so their absence there is ambiguous between SB-DB graceful '
+            'degradation and an un-enriched exporter.' % metric_name)
+
+    def _assert_router_port_labels_match_neutron(self, metric_name):
+        """Assert populated router_id/router_name/port_id map to real Neutron."""
+        samples = self._router_port_any_samples(metric_name)
+        self.assertNotEmpty(
+            samples,
+            '%s missing from metric-storage and live OVN scrape' % metric_name)
+        enriched = self._enriched_router_port_samples(samples)
+        if not enriched:
+            raise unittest.SkipTest(
+                '%s series carry no populated router_id/router_name/port_id; '
+                'the OVN Southbound enrichment (PR#68) is degraded to empty '
+                'labels on this deployment (SB DB unreachable) or the exporter '
+                'predates the feature.' % metric_name)
+        routers_by_id = self._neutron_routers_by_id()
+        self.assertNotEmpty(
+            routers_by_id,
+            'No Neutron routers to correlate %s enrichment against' %
+            metric_name)
+        router_port_ids = self._neutron_router_port_ids()
+        verified = []
+        for sample in enriched:
+            labels = sample['labels']
+            router_id = labels.get('router_id')
+            router_name = labels.get('router_name')
+            port_id = labels.get('port_id')
+            if not router_id:
+                continue
+            self.assertIn(
+                router_id, routers_by_id,
+                '%s router_id=%s is not a Neutron router (known: %s); '
+                'labels %s' % (
+                    metric_name, router_id, sorted(routers_by_id), labels))
+            if router_name:
+                self.assertEqual(
+                    routers_by_id[router_id]['name'], router_name,
+                    '%s router_name=%r != Neutron name %r for router_id=%s' % (
+                        metric_name, router_name,
+                        routers_by_id[router_id]['name'], router_id))
+            if port_id and router_port_ids:
+                self.assertIn(
+                    port_id, router_port_ids,
+                    '%s port_id=%s is not a Neutron router port (known: %s); '
+                    'labels %s' % (
+                        metric_name, port_id, sorted(router_port_ids),
+                        labels))
+            verified.append(sample)
+        self.assertNotEmpty(
+            verified,
+            '%s exposed enrichment labels but none carried a router_id to '
+            'verify against Neutron; samples %s' % (
+                metric_name,
+                [sample['labels'] for sample in enriched][:5]))
+        LOG.warning(
+            '%s Neutron-context labels verified for %d series (routers %s)',
+            metric_name, len(verified),
+            sorted({sample['labels'].get('router_id')
+                    for sample in verified}))
 
     def _configured_datapath_name(self):
         return CONF.nfv_plugin_options.network_exporter_datapath_name
