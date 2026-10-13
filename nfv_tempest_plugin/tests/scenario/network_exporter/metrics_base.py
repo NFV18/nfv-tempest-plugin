@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import base64
 import ipaddress
 import os
 import re
@@ -24,6 +25,7 @@ import requests
 import urllib3
 from tempest import config
 
+from nfv_tempest_plugin.tests.common import k8s
 from nfv_tempest_plugin.tests.scenario import base_test
 from oslo_log import log as logging
 
@@ -291,9 +293,23 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
     def __init__(self, *args, **kwargs):
         super(NetworkExporterMetricsBase, self).__init__(*args, **kwargs)
         self._hypervisor_id_cache = {}
+        self._k8s_client = None
         self._prometheus_https_verify = (
             PROMETHEUS_CA_CERT if PROMETHEUS_CA_CERT else False)
         self._prometheus_query_urls = self._prometheus_query_url_candidates()
+
+    @property
+    def k8s_client(self):
+        """Lazily build an OpenShift client for pod-scrape fallbacks.
+
+        Most helpers scrape compute :9105 / OVN :1981 over SSH and never need
+        the Kubernetes API; the client is only constructed when a pod-exec
+        fallback path is actually taken, so tests that stay node-local do not
+        require cluster access.
+        """
+        if self._k8s_client is None:
+            self._k8s_client = k8s.openshift_client()
+        return self._k8s_client
 
     @staticmethod
     def _prometheus_query_url_candidates():
