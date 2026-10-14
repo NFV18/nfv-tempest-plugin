@@ -129,8 +129,19 @@ class TestBasicInfrastructureMetrics(metrics_base.NetworkExporterMetricsBase):
                 else:
                     expected = self._ovs_bridge_flow_count(
                         bridge, hypervisor_ip)
-                reported = self._parse_metric_values_for_bridge(
-                    metric_stdout, bridge, hypervisor_ip)
+                # Prefer the live :9105 exposition over metric-storage.
+                # ``openstack metric show`` can return a stale sample (e.g. a
+                # higher port count from when test VMs were attached), while
+                # the live scrape reflects the same current OVS state we count
+                # with ovs-vsctl. Fall back to metric-storage if the live
+                # scrape is unavailable.
+                live_value = self._prom_compute_metric_value(
+                    hypervisor_ip, metric_name, {'bridge': bridge})
+                if live_value is not None and live_value != -1:
+                    reported = [live_value]
+                else:
+                    reported = self._parse_metric_values_for_bridge(
+                        metric_stdout, bridge, hypervisor_ip)
                 self.assertNotEmpty(
                     reported,
                     "Bridge '%s' exists on hypervisor %s (ovs-vsctl list-br) "
@@ -145,7 +156,7 @@ class TestBasicInfrastructureMetrics(metrics_base.NetworkExporterMetricsBase):
                 self.assertIn(
                     expected, reported,
                     "Metric '%s' on bridge '%s' hypervisor %s: OVS reports %s "
-                    "but openstack metric show had %s (stdout excerpt: %s)" % (
+                    "but the exporter reported %s (stdout excerpt: %s)" % (
                         metric_name, bridge, hypervisor_ip, expected, reported,
                         [line for line in metric_stdout.splitlines()
                          if '|' in line and bridge in line
