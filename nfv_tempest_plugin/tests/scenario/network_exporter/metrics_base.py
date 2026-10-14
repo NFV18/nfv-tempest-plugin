@@ -25,7 +25,6 @@ import requests
 import urllib3
 from tempest import config
 
-from nfv_tempest_plugin.tests.common import k8s
 from nfv_tempest_plugin.tests.scenario import base_test
 from oslo_log import log as logging
 
@@ -305,9 +304,11 @@ class NetworkExporterMetricsBase(base_test.BaseTest):
         Most helpers scrape compute :9105 / OVN :1981 over SSH and never need
         the Kubernetes API; the client is only constructed when a pod-exec
         fallback path is actually taken, so tests that stay node-local do not
-        require cluster access.
+        require cluster access. The k8s import is deferred here so this module
+        imports cleanly where the optional ``kubernetes`` dependency is absent.
         """
         if self._k8s_client is None:
+            from nfv_tempest_plugin.tests.common import k8s
             self._k8s_client = k8s.openshift_client()
         return self._k8s_client
 
