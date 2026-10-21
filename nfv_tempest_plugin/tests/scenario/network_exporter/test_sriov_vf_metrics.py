@@ -599,6 +599,54 @@ class TestSriovVfMetrics(net_vf_metrics_mixin.NetVfMetricsMixin,
                     'pci_address': expected_labels['pci_address'],
                 })
 
+    def test_net_vf_info_exposes_neutron_context_labels(self):
+        """Verify net_vf_info carries the port_id/vm_id enrichment label keys.
+
+        These labels enrich net_vf_info from the OVN Southbound Port_Binding
+        joined on the VF MAC. The compute :9105 exposition keeps the keys even
+        when the values degrade to empty, so this is a schema check for the
+        enrichment feature.
+        """
+        self._assert_net_vf_info_exposes_enrichment_label_keys()
+
+    def test_net_vf_info_labels_match_neutron_and_nova(self):
+        """Verify net_vf_info port_id/vm_id map to the VM Neutron port/instance.
+
+        For each test VM direct SR-IOV port, the net_vf_info series for that
+        VF must carry port_id equal to the Neutron port UUID and vm_id equal
+        to the Nova instance UUID. Skips when the OVN Southbound enrichment is
+        degraded to empty on this deployment so a transient SB outage does not
+        flap this test.
+        """
+        self._assert_net_vf_metric_reported(metrics_base.NET_VF_INFO_METRIC)
+        servers, _ = self._boot_sriov_vms()
+        sender, sender_port, receiver, receiver_port = self._select_peer_ports(
+            servers)
+        verified = set()
+        for server, port in ((sender, sender_port), (receiver, receiver_port)):
+            hypervisor_ip = server["hypervisor_ip"]
+            vf_labels = self._vf_labels_from_mac(
+                hypervisor_ip, port["mac_address"])
+            verified |= self._assert_net_vf_info_enrichment_matches(
+                hypervisor_ip, vf_labels, port["id"], server["id"])
+        if not verified:
+            raise unittest.SkipTest(
+                "net_vf_info exposed no populated port_id/vm_id for the test "
+                "VMs; the OVN Southbound enrichment is degraded to empty "
+                "labels on this deployment (SB DB unreachable) or the exporter "
+                "predates the feature.")
+        # SB enrichment is reachable (at least one label populated), so every
+        # enrichment label is expected to populate. A label that stayed empty
+        # here is an exporter/Port_Binding gap (e.g. vm_id regression), not SB
+        # degradation, so fail rather than pass on partial enrichment.
+        missing = set(metrics_base.NET_VF_INFO_ENRICHMENT_LABELS) - verified
+        self.assertFalse(
+            missing,
+            "net_vf_info verified %s but not %s for the test VMs; the SB "
+            "enrichment is reachable (some labels populated), so the missing "
+            "label(s) indicate an exporter/Port_Binding gap rather than SB "
+            "degradation." % (sorted(verified), sorted(missing)))
+
     def test_net_vf_guest_dataplane_mac_matches_port(self):
         """Verify each VM SR-IOV dataplane NIC MAC matches its Neutron port."""
         servers, key_pair = self._boot_sriov_vms()

@@ -215,6 +215,96 @@ class NetVfMetricsMixin(object):
             "numa_node": numa_node if numa_node else "-1",
         }
 
+    def _net_vf_info_samples_for_vf(self, hypervisor_ip, vf_labels):
+        """Live :9105 net_vf_info samples for one VF identity.
+
+        Reads the compute exposition (not metric-storage) so empty-valued
+        enrichment labels are preserved: Prometheus drops empty labels on
+        ingestion, which would hide a degraded port_id/vm_id.
+        """
+        identity = self._vf_identity_labels(vf_labels)
+        return self._prom_samples(
+            hypervisor_ip, metrics_base.NET_VF_INFO_METRIC,
+            required_labels=identity)
+
+    def _assert_net_vf_info_exposes_enrichment_label_keys(self):
+        """Assert net_vf_info carries port_id/vm_id label keys on :9105.
+
+        The compute :9105 exposition keeps the ``port_id`` and ``vm_id`` keys
+        even when the OVN Southbound DB is unreachable and they degrade to
+        empty strings, so their absence here means the exporter build predates
+        the enrichment feature. Returns the hypervisor IP that was validated.
+        """
+        hypervisor_ip = self._hypervisor_for_net_vf_metric(
+            metrics_base.NET_VF_INFO_METRIC)
+        self.assertIsNotNone(
+            hypervisor_ip,
+            'No hypervisor exports %s on compute :9105' %
+            metrics_base.NET_VF_INFO_METRIC)
+        samples = self._prom_samples(
+            hypervisor_ip, metrics_base.NET_VF_INFO_METRIC)
+        self.assertNotEmpty(
+            samples,
+            'No %s samples on compute :9105 for %s' % (
+                metrics_base.NET_VF_INFO_METRIC, hypervisor_ip))
+        missing = [
+            label for label in metrics_base.NET_VF_INFO_ENRICHMENT_LABELS
+            if not any(label in sample['labels'] for sample in samples)]
+        self.assertEqual(
+            [], missing,
+            '%s on %s is missing enrichment label key(s) %s. '
+            'Observed label keys: %s' % (
+                metrics_base.NET_VF_INFO_METRIC, hypervisor_ip, missing,
+                sorted({key for sample in samples
+                        for key in sample['labels']})))
+        LOG.warning(
+            '%s exposes enrichment label keys %s on compute :9105 (%s)',
+            metrics_base.NET_VF_INFO_METRIC,
+            metrics_base.NET_VF_INFO_ENRICHMENT_LABELS, hypervisor_ip)
+        return hypervisor_ip
+
+    def _assert_net_vf_info_enrichment_matches(
+            self, hypervisor_ip, vf_labels, expected_port_id, expected_vm_id):
+        """Assert one VF's net_vf_info port_id/vm_id match Neutron and Nova.
+
+        Returns the set of enrichment labels that were populated and verified.
+        Empty labels mean the OVN Southbound enrichment is degraded (the
+        exporter could not reach the SB DB to join the VF MAC to a
+        Port_Binding) and are reported to the caller rather than asserted, so
+        the caller can skip rather than fail on a known-degraded deployment.
+        """
+        samples = self._net_vf_info_samples_for_vf(hypervisor_ip, vf_labels)
+        identity = self._vf_identity_labels(vf_labels)
+        self.assertNotEmpty(
+            samples,
+            'No %s sample on %s for VF %s (expected port_id=%s vm_id=%s)' % (
+                metrics_base.NET_VF_INFO_METRIC, hypervisor_ip, identity,
+                expected_port_id, expected_vm_id))
+        expected = {'port_id': expected_port_id, 'vm_id': expected_vm_id}
+        verified = set()
+        for label, want in expected.items():
+            populated = {sample['labels'].get(label, '')
+                         for sample in samples
+                         if sample['labels'].get(label, '')}
+            if not populated:
+                LOG.warning(
+                    '%s %s empty on %s for VF %s (OVN Southbound enrichment '
+                    'degraded/unavailable); skipping value match',
+                    metrics_base.NET_VF_INFO_METRIC, label, hypervisor_ip,
+                    identity)
+                continue
+            self.assertIn(
+                want, populated,
+                '%s %s=%s expected for VF %s on %s but exporter reported %s' % (
+                    metrics_base.NET_VF_INFO_METRIC, label, want, identity,
+                    hypervisor_ip, sorted(populated)))
+            verified.add(label)
+            LOG.warning(
+                '%s %s verified for VF %s on %s: %s',
+                metrics_base.NET_VF_INFO_METRIC, label, identity,
+                hypervisor_ip, want)
+        return verified
+
     def _counter_value(self, hypervisor_ip, metric_name, vf_labels):
         """Read one net_vf counter from compute :9105 for a single VF."""
         identity = self._vf_identity_labels(vf_labels)

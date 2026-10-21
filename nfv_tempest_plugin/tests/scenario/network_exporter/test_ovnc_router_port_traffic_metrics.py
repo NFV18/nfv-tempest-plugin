@@ -352,14 +352,75 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
 
     # --- Presence ---
 
+    def _ensure_router_port_traffic(self):
+        """Create an isolated router + two VMs and drive cross-subnet traffic
+        so the ovnc_router_port_traffic_* counters are populated.
+
+        Makes the presence/enrichment tests self-contained instead of relying
+        on pre-existing router traffic. Resources are created via
+        create_and_verify_resources on the router (non-direct) test-networks
+        with unique names and automatic cleanup, so they do not collide with
+        the SR-IOV net_vf workload or any other test. Returns the hypervisor
+        IP that carried the traffic.
+        """
+        servers, key_pair = self._boot_router_traffic_vms()
+        self.assertEqual(2, len(servers), 'Test requires exactly two VMs')
+        if not servers[0].get('provider_networks'):
+            if self.test_all_provider_networks and servers[0].get('fip'):
+                self.verify_provider_networks(servers, key_pair)
+            else:
+                self._populate_provider_networks(servers)
+        sender, receiver = servers[0], servers[1]
+        ssh_sender = self.get_remote_client(
+            sender['fip'], self.instance_user, key_pair['private_key'])
+        ssh_receiver = self.get_remote_client(
+            receiver['fip'], self.instance_user, key_pair['private_key'])
+        endpoints = self._router_traffic_endpoints(
+            ssh_sender, ssh_receiver, sender, receiver)
+        if not endpoints:
+            raise unittest.SkipTest(
+                'No cross-subnet IPs between VMs for %s; cannot drive '
+                'router-port traffic' % self.TEST_NAME)
+        self._send_router_cross_subnet_traffic(
+            endpoints, self._traffic_ping_count())
+        return sender['hypervisor_ip']
+
     def test_ovnc_router_port_traffic_pkts_reported(self):
         """Verify ovnc_router_port_traffic_pkts in metric-storage."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_metric_reported(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
 
     def test_ovnc_router_port_traffic_bytes_reported(self):
         """Verify ovnc_router_port_traffic_bytes in metric-storage."""
+        self._ensure_router_port_traffic()
         self._assert_router_port_metric_reported(
+            metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
+
+    # --- Neutron context enrichment (openstack-network-exporter PR #68) ---
+
+    def test_ovnc_router_port_traffic_pkts_exposes_neutron_context_labels(self):
+        """Verify ovnc_router_port_traffic_pkts carries the SB enrichment labels."""
+        self._ensure_router_port_traffic()
+        self._assert_router_port_enrichment_labels_exposed(
+            metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
+
+    def test_ovnc_router_port_traffic_bytes_exposes_neutron_context_labels(self):
+        """Verify ovnc_router_port_traffic_bytes carries the SB enrichment labels."""
+        self._ensure_router_port_traffic()
+        self._assert_router_port_enrichment_labels_exposed(
+            metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
+
+    def test_ovnc_router_port_traffic_pkts_labels_match_neutron(self):
+        """Verify router_id/router_name/port_id map to real Neutron resources."""
+        self._ensure_router_port_traffic()
+        self._assert_router_port_labels_match_neutron(
+            metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
+
+    def test_ovnc_router_port_traffic_bytes_labels_match_neutron(self):
+        """Verify router_id/router_name/port_id map to real Neutron resources."""
+        self._ensure_router_port_traffic()
+        self._assert_router_port_labels_match_neutron(
             metrics_base.OVNC_ROUTER_PORT_TRAFFIC_BYTES_METRIC)
 
     # --- Traffic ---
@@ -415,3 +476,41 @@ class TestOvncRouterPortTrafficMetrics(metrics_base.NetworkExporterMetricsBase):
             result['pkts_delta'], result['pkts_key'],
             result['pkts_peak_delta'], result['bytes_delta'],
             result['bytes_key'], result['bytes_peak_delta'])
+        self._verify_incrementing_port_neutron_context(result['pkts_key'])
+
+    def _verify_incrementing_port_neutron_context(self, pkts_key):
+        """Confirm the port that carried traffic exposes its Neutron context.
+
+        The SB enrichment labels (openstack-network-exporter PR #68) degrade to
+        empty strings when the OVN Southbound DB is unreachable, so a missing
+        context is logged rather than failed here; the dedicated
+        ``*_labels_match_neutron`` tests assert enrichment when it is present.
+        """
+        enrichment = self._router_port_enrichment_by_key(
+            metrics_base.OVNC_ROUTER_PORT_TRAFFIC_PKTS_METRIC)
+        context = enrichment.get(pkts_key)
+        if not context or not any(context.values()):
+            LOG.warning(
+                'Router port %s carried traffic but exposes no Neutron-context '
+                'labels (SB DB enrichment degraded or unavailable): %s',
+                pkts_key, context)
+            return
+        LOG.warning(
+            'Router port %s that carried traffic maps to Neutron context %s',
+            pkts_key, context)
+        router_id = context.get('router_id')
+        if router_id:
+            routers_by_id = self._neutron_routers_by_id()
+            self.assertIn(
+                router_id, routers_by_id,
+                'router_id=%s on traffic-carrying port %s is not a Neutron '
+                'router (known: %s)' % (
+                    router_id, pkts_key, sorted(routers_by_id)))
+            router_name = context.get('router_name')
+            if router_name:
+                self.assertEqual(
+                    routers_by_id[router_id]['name'], router_name,
+                    'router_name=%r != Neutron name %r for router_id=%s on '
+                    'traffic-carrying port %s' % (
+                        router_name, routers_by_id[router_id]['name'],
+                        router_id, pkts_key))
